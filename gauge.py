@@ -1,75 +1,6 @@
 #!/usr/bin/env python3
 r"""
-Backlit silhouette gauge -- coupon length and width from one image.
-Variable names follow PaperSteel_Onshape_Variables.csv so the code and the CAD
-parametric model cannot drift apart.
-
-PHYSICAL SETUP
---------------
-        camera            armZ    = zSpec + workDist + camStack
-          |
-          |  workDist             lens front face -> specimen plane
-          v
-    [==== coupon ====]    specT   = specTden (5.5) or specTraw (27)
-    ------------------    zSpec   = zPanBot + panT + ribH = 62 mm  <- MEASUREMENT DATUM
-        backlight         zBacklight = 14 mm
-
-THE MEASUREMENT CHAIN
----------------------
-    objDist   = lensF * (1 + 1/mag)      principal plane -> specimen PLANE
-    sObj      = objDist - specT          -> silhouette-forming TOP face
-    mmPerPx   = (sObj - lensF) / focalPx
-    size_mm   = size_px * mmPerPx
-
-Why (sObj - lensF) and not sObj:
-    A pinhole scales as s. A real lens scales as (s - f), because the transverse
-    magnification is m = f/(s - f). With lensF = 12 mm and objDist = 462 mm the two
-    differ by 2.66% in absolute scale -- which calibration absorbs harmlessly, since
-    it only rescales focalPx.
-
-    What calibration does NOT absorb is the thickness correction, because that is a
-    DIFFERENCE of scales at two standoffs. Measured on this geometry:
-
-        specT =  5.5 mm : correction is 12210 ppm, pinhole errs by  +321 ppm
-        specT = 27   mm : correction is 59940 ppm, pinhole errs by +1655 ppm
-
-    Against a length budget of 125 ppm (25 um on specL = 200 mm), the pinhole form
-    alone is 2.6x over at the densified thickness and 13x over at the raw thickness.
-    Hence lensF appears explicitly in the scale law.
-
-Why specT subtracts at all, and subtracts in full:
-    The dark region is the coupon outline seen from the lens. A block with vertical
-    walls has two candidate outlines, its top face and its bottom face; the top face
-    is nearer the lens, subtends a larger angle and projects larger, so the bottom
-    face outline falls strictly inside it and is never visible. The outline measured
-    is therefore the TOP face, one full thickness above zSpec.
-
-    Not a small correction here: 5.5 mm at objDist 462 mm is 1.2%, which on
-    couponW = 21.25 mm is 259 um. On a raw 27 mm panel it is 1.27 mm.
-
-WHY THE ABSOLUTE STANDOFF BARELY MATTERS
-----------------------------------------
-    Calibration solves  focalPx = W_cal_px * (s_cal - lensF) / W_cal_mm. Substituting
-    back collapses the chain to:
-
-        W_mm = W_cal_mm * (W_px / W_cal_px) * (sObj - lensF) / (s_cal - lensF)
-
-    Only the RATIO survives, so the entrance pupil position never has to be known and
-    objDist need only be REPEATABLE between calibration and measurement, not known
-    absolutely. Refocusing changes both f and the pupil position and voids this
-    silently -- focus once, lock the ring, recalibrate if disturbed.
-
-    Sanity check on any calibration: focalPx should land near lensF / pxPitch
-    = 12 / 0.00155 = 7742 px. A large discrepancy means the built geometry is not
-    what the CAD says it is.
-
-WHY NOT THRESHOLD TO BLACK AND WHITE
-------------------------------------
-    A threshold snaps each edge to a whole pixel, costing the full mmPerPx (58.2 um
-    here) on both edges. The greyscale gradient-centroid path below reaches ~0.02 px,
-    i.e. ~1.2 um. Binarise for a visual check if you like; never measure off it.
-
-    pip install numpy opencv-python requests
+Code for gauging the length/width of a visible coupon in a backlit image. The coupon is assumed to be dark on a bright
 """
 from __future__ import annotations
 
@@ -95,9 +26,6 @@ MAX_RESID_FRAC = 0.01           # default ceiling on the edge fit residual,
 
 @dataclass
 class Config:
-    """Names match PaperSteel_Onshape_Variables.csv. Inputs carry the CSV values;
-    DERIVED quantities are properties computed by the CSV formulas, so changing an
-    input propagates instead of leaving a stale duplicate."""
 
     host: str = "192.168.1.50"
 
@@ -186,13 +114,8 @@ class Config:
     # ---- DERIVED, mirroring the CSV formulas --------------------------------
     @property
     def couponW(self) -> float:
-        """Coupon width that actually fits -- derived from the panel, not chosen."""
+        """Coupon width."""
         return (self.specW - (self.couponN - 1) * self.couponGap) / self.couponN
-
-    @property
-    def zSpec(self) -> float:
-        """SPECIMEN PLANE -- the primary measurement datum."""
-        return self.zPanBot + self.panT + self.ribH
 
     @property
     def fovL(self) -> float:
@@ -227,17 +150,12 @@ class Config:
         return self.fovL / self.pixelsL
 
     @property
-    def armZ(self) -> float:
-        """Camera arm underside -- derived, so moving the specimen plane moves the camera."""
-        return self.zSpec + self.workDist + self.camStack
-
-    @property
     def focalPxNominal(self) -> float:
         """What --calibrate should land near, from first principles."""
         return self.lensF / self.pxPitch
 
     def sObj(self, thickness: Optional[float] = None) -> float:
-        """Principal plane -> the silhouette-forming TOP face of the coupon."""
+        """Principal plane --> the silhouette-forming top face of the coupon."""
         t = self.specT if thickness is None else thickness
         s = self.objDist - t
         if s <= self.lensF:
@@ -266,23 +184,6 @@ class Config:
 
 # ============================================================== camera ======
 
-# Every one of these is a CONTENT-DEPENDENT transform: it changes pixel values as a
-# function of what is in the scene. That means the measured edge position moves when
-# the scene moves, which is exactly the failure a metrology rig cannot tolerate. For
-# measurement you want the sensor to behave like a boring linear photon counter.
-#
-#   awb / awb_gain / wb_mode  white balance -- per-channel gains that chase the scene
-#   aec / aec2 / ae_level     auto exposure -- brightness changes between frames
-#   agc / agc_gain            auto gain -- also raises read noise; pin it at minimum
-#   bpc / wpc                 dead-pixel correction -- silently rewrites pixel values
-#   raw_gma                   gamma -- OFF keeps the response linear, which is what the
-#                             gradient-centroid estimator assumes
-#   lenc                      lens shading correction -- a spatially varying gain, so
-#                             the same edge reads differently at different field
-#                             positions. Poison for this application.
-#   dcw                       downsize/rescale -- an extra resampling stage
-#   sharpness / denoise       edge enhancement. This one will physically MOVE your
-#                             edges, and is the single worst setting to leave on.
 CAM = [("awb", 0), ("awb_gain", 0), ("wb_mode", 0), ("aec", 0), ("aec2", 0),
        ("ae_level", 0), ("agc", 0), ("agc_gain", 0), ("gainceiling", 0),
        ("bpc", 0), ("wpc", 0), ("raw_gma", 0), ("lenc", 0), ("dcw", 0),
@@ -292,8 +193,7 @@ CAM = [("awb", 0), ("awb_gain", 0), ("wb_mode", 0), ("aec", 0), ("aec2", 0),
 
 def setup(cfg: Config) -> None:
     """Push the sensor into a fixed, deterministic state via the CameraWebServer
-    /control endpoint. Some vars are sensor-specific and will 404 on an OV2640 --
-    that is harmless, hence the warn-and-continue."""
+    /control endpoint."""
     url = f"http://{cfg.host}/control"
     for var, val in [("framesize", cfg.framesize), ("quality", cfg.jpegQuality),
                      ("aec_value", cfg.exposure), *CAM]:
@@ -305,11 +205,7 @@ def setup(cfg: Config) -> None:
 
 
 def frame(cfg: Config) -> np.ndarray:
-    """Grab one still and return it as float32 greyscale.
-
-    float32, not uint8: the gradient and centroid arithmetic downstream needs
-    fractional values, and doing it in integers would quantise away the subpixel
-    information the whole method depends on."""
+    """Grab one still and return it as float32 greyscale."""
     r = requests.get(f"http://{cfg.host}/capture", timeout=10)
     r.raise_for_status()
     img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -319,13 +215,7 @@ def frame(cfg: Config) -> np.ndarray:
 
 
 def load(path: str) -> np.ndarray:
-    """Read an image FILE as float32 -- same output as frame(), so every downstream
-    stage is identical whether the pixels came from a camera or from disk.
-
-    Handles 16-bit input (a raw green plane from pi_capture.py) as well as 8-bit.
-    Deeper data is rescaled to the 0-255 range as FLOAT, not as integers, so the
-    extra bits survive into the edge estimator while minContrast and the DN
-    diagnostics keep the same meaning across both sources."""
+    """Read an image file as float32"""
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError(f"could not read {path}")
@@ -356,39 +246,6 @@ def _peaks(prof: np.ndarray, k: int, sep: int) -> list[tuple[int, float]]:
 def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
              min_contrast_hint: float = 20.0) -> tuple[int, int, int, int]:
     """Locate the specimen and return an ROI around it, from gradient projections.
-
-    WHY NOT A THRESHOLD. Otsu picks one global level for the whole frame, which fails
-    outright on an uneven backlight: on a real test frame the background was 217 DN
-    above the coupon and 146 DN below it while the coupon sat at 76 DN, so the dim
-    lower background landed on the coupon side of the split and merged with it. Every
-    global threshold has this failure.
-
-    WHAT THIS DOES INSTEAD. It looks for the four EDGES, not for the region. A slow
-    illumination gradient has a small derivative spread over hundreds of pixels; a
-    specimen edge has a large derivative concentrated in a few. Projecting the signed
-    x-derivative down the rows gives sharp peaks on a flat baseline however uneven the
-    lighting is: FALLING peaks (bright to dark) and RISING peaks (dark to bright).
-
-    WHY PAIRS, NOT THE STRONGEST PEAK. A real rig has other full-height edges, and
-    they can easily be stronger than the specimen. A backlight aperture inside a dark
-    surround is the common case, and on a test frame its edges scored 24267 and 16574
-    against the coupon's 13287. But polarity disambiguates them completely:
-
-        dark surround -> bright aperture -> dark surround   gives RISE then FALL
-        bright field  -> dark specimen   -> bright field    gives FALL then RISE
-
-    So the specimen is the strongest fall/rise pair with the FALL on the left. Taking
-    the global argmax of each profile instead picks one edge from the aperture and one
-    from the coupon, which is what the earlier version did. Scoring on min() of the
-    two rather than the sum insists both edges are real, so one very strong edge
-    cannot drag in a weak partner.
-
-    Small features are suppressed for free: pencil marks on a test coupon are strong
-    gradients but span a few dozen rows out of hundreds, so they contribute a few
-    percent of what a full-height edge does.
-
-    `min_prominence` is peak height over the profile median. Below it the detection is
-    untrustworthy and this raises rather than returning a plausible-looking box.
     """
     H, W = img.shape
     sm = cv2.GaussianBlur(img, (0, 0), 2.0)
@@ -401,14 +258,6 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
         edge = max(3, n // 50)                       # ignore frame-border artefacts
         fall[:edge] = fall[n - edge:] = 0
         rise[:edge] = rise[n - edge:] = 0
-
-        # Two different jobs, previously conflated. `nms` is how far apart two
-        # peaks must be to count as separate humps -- a few pixels, set by the
-        # edge width. `pair` is the minimum extent of the object itself, and
-        # scaling THAT to the frame was a bug: a thin specimen viewed edge-on is
-        # far narrower than n/20, so its own edge pair was rejected as too close
-        # together and a background feature won instead. On the side camera,
-        # where the thickness is the small dimension, that is the normal case.
         nms = max(3, n // 200)
         pair = max(3, n // 400)
         F, R = _peaks(fall, 6, nms), _peaks(rise, 6, nms)
@@ -425,14 +274,6 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
                     best = (xf, xr, score)
 
         if best is not None:
-            # Take the OUTER foot of each gradient hump, not its peak. A tilted
-            # specimen spreads one edge over L*sin(theta) rows, so its projection
-            # is a broad plateau rather than a spike and the peak sits somewhere
-            # in the middle of it -- which cropped a 636 px tall bar to 381 px at
-            # 4 degrees and starved the perpendicular scan of lines. Walking out
-            # to where the hump falls to a fifth of its height recovers the true
-            # extent, and for an untilted specimen the hump is a spike so this
-            # changes nothing.
             xf, xr, sc = best
             f_lo, r_hi = xf, xr
             while f_lo > edge and fall[f_lo - 1] > 0.2 * fall[xf]:
@@ -451,10 +292,6 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
     x0, x1, px = locate(gx, 0, W)
     y0, y1, py = locate(gy, 1, H)
     if min(px, py) < min_prominence:
-        # Name the axis. They fail for different reasons: a weak X usually means
-        # something else in frame -- a platform edge, a bright strip -- is raising
-        # the baseline the specimen has to stand out from; a weak Y often just
-        # means the specimen presents a short edge to that axis after rotation.
         axis = "X (left/right edges)" if px < py else "Y (top/bottom edges)"
         raise RuntimeError(
             f"edge peaks too weak on {axis}: prominence X {px:.1f}, Y {py:.1f}, "
@@ -465,12 +302,7 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
     box = (int(max(0, x0 - margin)), int(max(0, y0 - margin)),
            int(min(W, x1 + margin)), int(min(H, y1 + margin)))
 
-    # Confirm the box actually contains a DARK OBJECT. The projections above find
-    # strong intensity transitions, and a backlit specimen is only one thing that
-    # produces those -- a platform rim, a bright strip, the edge of an aperture all
-    # qualify. Lowering min_prominence to force a detection makes this more likely,
-    # not less, and the failure then surfaces much later as "0 valid lines" from a
-    # box sitting on empty background.
+    # Confirm the box actually contains a dark object.
     bx0, by0, bx1, by1 = box
     inner = img[by0:by1, bx0:bx1]
     if inner.size:
@@ -495,27 +327,6 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
 def _row(prof: np.ndarray, cfg: Config) -> Optional[tuple[float, float]]:
     """Locate the left and right edge of one dark-on-bright intensity profile,
     to a fraction of a pixel.
-
-    Two stages:
-
-    1. COARSE -- find where the profile drops below the midpoint of its own min and
-       max. Using a level derived per-line, rather than a fixed global threshold,
-       makes this immune to uneven backlight illumination across the frame. This only
-       needs to be right to a pixel or two; it just tells stage 2 where to look.
-
-    2. REFINE -- gradient centroid:   x = sum(x * |g|) / sum(|g|)
-
-       The intensity step is blurred into a ramp several pixels wide by diffraction,
-       defocus and the pixel aperture. That blur is symmetric about the true edge, so
-       the gradient |g| is a symmetric bump centred on it, and the centroid of a
-       symmetric bump is its centre -- regardless of how wide the blur is, how bright
-       the lamp is, or how much contrast there happens to be. That indifference is the
-       whole point: a fixed threshold drifts as the lamp ages and as the specimen
-       darkens, and the centroid does not.
-
-       Two iterations: the first centroid is computed about the coarse estimate, which
-       may sit a pixel or so off, making the window asymmetric and pulling the answer.
-       Recentring on that result and recomputing removes almost all of it.
     """
     lo, hi = float(prof.min()), float(prof.max())
     if hi - lo < cfg.minContrast:
@@ -543,13 +354,7 @@ def _row(prof: np.ndarray, cfg: Config) -> Optional[tuple[float, float]]:
 
 
 def grad_width(img: np.ndarray, cfg: Config, n: int = 16) -> Optional[float]:
-    """RMS width of the gradient bump, in px, median over n sampled lines.
-
-    This is the actual optical transition width -- diffraction plus defocus plus the
-    pixel aperture plus our own pre-smoothing. The centroid window has to be scaled to
-    it: a window narrower than the bump clips the tails, and because the clipping is
-    asymmetric near a boundary the centroid walks inward. Measuring it beats guessing,
-    because it changes whenever the lens, aperture or focus changes."""
+    """RMS width of the gradient bump, in px, median over n sampled lines."""
     out = []
     for y in range(0, img.shape[0], max(1, img.shape[0] // n)):
         prof = img[y]
@@ -595,31 +400,7 @@ def scan(roi: np.ndarray, cfg: Config) -> tuple[np.ndarray, np.ndarray, np.ndarr
 
 
 def valid_band(pos, lo, hi):
-    """Rows where BOTH detected edges lie on the specimen's END faces.
-
-    THE PROBLEM. Each scan line reports its outermost dark pixels. On a coupon
-    square to the frame those are always the two end faces -- one straight edge
-    each, and the line fit is clean. Tilt it and that stops being true: past the
-    corner, the outermost point jumps onto a LONG edge and races sideways. The
-    point set becomes two segments meeting at a corner, and one straight line
-    forced through both gives a meaningless slope and an enormous residual.
-    Measured on a 3400x400 px bar: at 0.5 deg the RMS is 0.49 px, at 2 deg it is
-    329 px and the reported tilt runs to 68 degrees.
-
-    THE TEST. The two regimes differ by orders of magnitude in how fast the edge
-    moves per row. Along an end face the step is tan(theta) -- hundredths of a
-    pixel. Along a long edge it is 1/tan(theta) -- tens of pixels. So the valid
-    band is simply the longest run of rows over which the edge advances slowly,
-    and that test is indifferent to taper, which changes the step by a fraction
-    of a percent rather than a factor of a thousand.
-
-    Short interruptions are bridged so that a nick or a dust speck splits nothing.
-
-    LIMIT. A band where both ends are simultaneously on end faces exists only
-    while tan(theta) < T/L -- about 6.7 degrees for a 8.5:1 coupon, and it
-    narrows to nothing there. Beyond that no scan line crosses both end faces and
-    the dimension is not recoverable this way; the caller gets an empty band and
-    should say so rather than report a number.
+    """Rows where BOTH detected edges lie on the specimen's end faces.
     """
     def run_of(v):
         d = np.abs(np.diff(v))
@@ -663,19 +444,7 @@ class Line(NamedTuple):
 
 
 def fit(y: np.ndarray, x: np.ndarray, k: float = 3.0) -> Line:
-    """Least-squares line through the subpixel edge points, with outlier rejection.
-
-    WHY FIT A LINE AT ALL. A single row places its edge to maybe 0.1 px. Fitting a
-    line through N of them averages that down as 1/sqrt(N) -- roughly 0.004 px on the
-    intercept for 600 rows. That improvement is the entire reason this rig can beat
-    its own pixel pitch, and it works only because the edge really is straight. The
-    `rms` field is the check: if it climbs, the specimen edge is not straight and the
-    averaging argument no longer holds.
-
-    OUTLIER REJECTION uses the median absolute deviation rather than the standard
-    deviation, because a single bad row (dust, a nick in the specimen, a JPEG ringing
-    artefact) inflates sigma enough to hide itself. The 1.4826 converts MAD to an
-    equivalent sigma for Gaussian noise. Three passes; it converges in one or two."""
+    """Least-squares line with outlier rejection."""
     keep = np.ones(y.size, bool)
     m = c = 0.0
     for _ in range(3):
@@ -703,28 +472,7 @@ def fit(y: np.ndarray, x: np.ndarray, k: float = 3.0) -> Line:
 
 
 def gap(a: Line, b: Line, at: float = 0.0) -> float:
-    """Perpendicular distance between two nominally parallel edges.
-
-    Both lines are x = m*y + c. `at` is the position along the scan axis where the
-    separation is evaluated, and it MATTERS the moment the two edges are not
-    parallel: the intercept difference is the separation extrapolated to position
-    0, which is one END of the ROI, not the middle. On a coupon that tapers by 10%
-    that reported the narrow end and was 5% low against the true mean -- a real
-    error found on real specimens, not a hypothetical. Pass the midpoint of the
-    scanned range and you get the width at the centre, which for parallel edges is
-    identical and for a tapered one is representative.
-
-    Note that a single number cannot describe a coupon whose width genuinely
-    varies; use chords.py for the profile. This makes the single number the least
-    misleading one available. But if the specimen is rotated in the frame by
-    theta = atan(m), that horizontal gap is the true width divided by cos(theta) -- you
-    are measuring a diagonal slice across the part. Hence:
-
-        true width = |dc| * cos(atan(m)) = |dc| / sqrt(1 + m^2)
-
-    Small angle, real cost: at just 1.6 degrees of tilt the uncorrected value is 5 um
-    high on a 12.5 mm width. Averaging the two slopes assumes the edges are parallel,
-    which for a machined coupon they are to well within the noise."""
+    """Perpendicular distance between two nominally parallel edges."""
     m = 0.5 * (a.slope + b.slope)
     sep = abs((b.slope * at + b.icept) - (a.slope * at + a.icept))
     return sep / np.sqrt(1 + m * m)
@@ -744,14 +492,7 @@ class Result(NamedTuple):
 
 def _check_fit(a: Line, b: Line, span: float, what: str,
                frac: float = MAX_RESID_FRAC) -> None:
-    """Refuse to return a number when the straight-line model has clearly failed.
-
-    The residual RMS separates the two regimes by orders of magnitude. A real
-    sawn wood edge sits around 1.7 px -- that is genuine fibre tear-out, and the
-    line still averages it down to a few microns. A fit spanning two different
-    edges of a rotated coupon reads 200-500 px. Anything approaching a percent of
-    the dimension being measured is not a rough edge, it is the wrong model, and
-    the millimetres it produces look entirely plausible.
+    """Refuse to return a faulty number.
     """
     lim = max(3.0, frac * span)
     worst = max(a.rms, b.rms)
@@ -814,11 +555,6 @@ def measure(img: np.ndarray, cfg: Config, thickness: Optional[float] = None) -> 
     # the lensF term matters (321 ppm at specTden, 1655 ppm at specTraw).
     mmpx = cfg.mmPerPx(thickness)
 
-    # The row scan gives the HORIZONTAL extent and the column scan the VERTICAL one.
-    # Which is "length" depends only on how the operator laid the coupon down, so
-    # assign by magnitude: on a tensile coupon the length is always the larger of the
-    # two (couponW 21.25 mm vs specL 200 mm). Set cfg.autoOrient = False to keep the
-    # raw image axes.
     if cfg.autoOrient and w_px > l_px:
         w_px, l_px = l_px, w_px
 
@@ -847,25 +583,13 @@ def run(cfg: Config, thickness: Optional[float]) -> None:
     print(f"\n  n = {len(w)}/{cfg.nFrames}   scale {r.um_per_px:.4f} um/px")
     print(f"  WIDTH   {w.mean():8.4f} mm   1s {w.std(ddof=1)*1000:6.1f} um")
     print(f"  LENGTH  {l.mean():8.4f} mm   1s {l.std(ddof=1)*1000:6.1f} um")
-    # The spread is REPEATABILITY, not accuracy. It tells you nothing about whether the
-    # mean is right. Averaging drives the random term down as 1/sqrt(N) and does
-    # precisely nothing to a systematic error -- a wrong thickness, a moved lens or a
-    # stale calibration will give you a beautifully precise wrong answer.
     print("  (repeatability only - averaging does nothing to bias)")
 
 
 def calibrate(known_mm: float, height_mm: float, cfg: Config) -> None:
     """Solve focalPx from an artefact of known width at a known height above zSpec:
 
-        focalPx = width_px * (s_cal - lensF) / known_mm
-
-    Calibration still needs one length standard even though nothing sits in the frame
-    during measurement. Use something dimensionally stable and certified -- a slip
-    gauge, a ground pin, a precision ring -- not a ruler or a printed target.
-
-    height_mm sets s_cal exactly the way specT sets sObj, so an error here becomes a
-    fixed bias on every later measurement. Calibrate at the geometry you will measure
-    at and the standoff cancels in the ratio (see module docstring)."""
+        focalPx = width_px * (s_cal - lensF) / known_mm"""
     s_cal = cfg.effDistance - height_mm      # A - h, the only distance that matters
     cfg.focalPx = 1.0                 # placeholder: measure() refuses on 0, and only
                                       # width_px is wanted here, so the scale is moot
@@ -894,29 +618,7 @@ def calibrate(known_mm: float, height_mm: float, cfg: Config) -> None:
 
 def calib_stack(pairs: list[tuple[str, float]], known_mm: float,
                 cfg: Config) -> tuple[float, float]:
-    """Solve BOTH optical unknowns from images of one artefact at several heights.
-
-    The scale law is  mm/px = (A - h) / focalPx, where h is the height of the
-    silhouette-forming face above the platform and A = objDist - lensF. For a fixed
-    artefact of width W0 imaged at height h:
-
-        W0 = px(h) * (A - h) / focalPx      ->      px(h) * (A - h) = W0 * focalPx
-
-    The right side is constant, so px*(A-h) is the same at every height. With two
-    heights that is two equations in two unknowns:
-
-        A       = (px1*h1 - px2*h2) / (px1 - px2)
-        focalPx = px1 * (A - h1) / W0
-
-    Why this matters more than it looks: it calibrates the SLOPE of the thickness
-    correction, not just the scale. On this geometry the correction is 12210 ppm at
-    specTden, and getting its slope wrong by a few percent is the error that
-    calibration at a single height cannot see. It also means you never need lensF,
-    lensPP or the principal plane location -- which on an ESP32-CAM module you have
-    no way to look up.
-
-    Use three or more heights: the fit residual is then a real check that the model
-    holds, rather than an assumption. Heights must be KNOWN -- stack slip gauges."""
+    """Solve optical unknowns from images of one artefact at several heights."""
     if len(pairs) < 2:
         raise ValueError("need at least two heights")
 
@@ -953,13 +655,7 @@ CALIB_FILE = "calibration.json"
 
 
 def save_calib(path: str, focalPx: float, cfg: Config, **prov) -> None:
-    """Persist the calibration so it survives between runs.
-
-    A calibration is a property of the OPTICS, not of any specimen, so retyping it
-    on every command is both tedious and a live source of error -- a mistyped digit
-    scales every result and nothing in the output looks wrong. Provenance is stored
-    alongside it because a calibration you cannot date or trace is one you cannot
-    decide whether to trust."""
+    """Persist the calibration so it survives between runs."""
     rec = {"focalPx": round(focalPx, 4), "effDist": round(cfg.effDistance, 4),
            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"), **prov}
     with open(path, "w") as fh:
@@ -968,14 +664,7 @@ def save_calib(path: str, focalPx: float, cfg: Config, **prov) -> None:
 
 
 def scale_focal(focalPx: float, calib_width: int, image_width: int) -> float:
-    """Rescale focalPx when the image resolution differs from the calibration.
-
-    focalPx is a length expressed IN PIXELS, so it is meaningless without the
-    resolution that produced it. Calibrating on a 4056 px frame and then
-    measuring a 2028 px green plane -- which is exactly what happens when you
-    move from a processed JPEG to raw Bayer -- halves every pixel count, and
-    without this the result comes out 2x wrong while looking entirely plausible.
-    """
+    """Rescale focalPx when the image resolution differs from the calibration."""
     if not calib_width or calib_width == image_width:
         return focalPx
     return focalPx * image_width / calib_width
@@ -1014,13 +703,6 @@ LOG_FIELDS = ["when", "image", "length_mm", "width_mm", "length_px", "width_px",
 
 def log_row(path: str, cfg: Config, r: "Result", image: str, note: str = "") -> None:
     """Append one measurement to a CSV, creating it with a header if new.
-
-    The calibration context is written alongside every row on purpose. A number
-    like "199.98 mm" is not interpretable six months later without knowing which
-    focalPx and effDist produced it and what thickness was assumed -- and those
-    are exactly the things that change when someone nudges the rig. Storing them
-    per row means a later recalibration can be applied retrospectively, and a
-    drifted session can be identified rather than guessed at.
     """
     new = not os.path.exists(path) or os.path.getsize(path) == 0
     with open(path, "a", newline="") as fh:
@@ -1046,12 +728,7 @@ def log_row(path: str, cfg: Config, r: "Result", image: str, note: str = "") -> 
 
 
 def diagnose(img: np.ndarray, cfg: Config) -> None:
-    """Report WHY rows are being rejected, instead of just how many.
-
-    `scan` deliberately drops any line it cannot measure cleanly, which is right for
-    a measurement but useless for debugging: "0 valid lines" has at least five
-    distinct causes and they need opposite fixes. This replays the same logic and
-    counts each one."""
+    """Report rejected rows"""
     x0, y0, x1, y1 = cfg.roi
     H, W = img.shape
     if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
@@ -1122,27 +799,6 @@ def overlay(path: str, cfg: Config) -> None:
     cv2.imwrite(path, vis)
     L, R = fit(y, xl), fit(y, xr)
     print(f"{path}: {L.n}/{y1-y0} rows, edge RMS {L.rms:.3f}/{R.rms:.3f} px")
-
-
-def geometry(cfg: Config) -> None:
-    """Print the derived chain. Cross-check these against Onshape before building."""
-    print("  INPUTS")
-    for k in ("specL","specW","specTraw","specTden","couponN","couponGap",
-              "zPanBot","panT","ribH","zBacklight","fovMargin","sensorW","sensorH",
-              "pixelsL","lensF","lensPP","camStack"):
-        print(f"    {k:<12}{getattr(cfg,k)}")
-    print("  DERIVED")
-    for k in ("couponW","zSpec","fovL","fovW","mag","workDist","armZ",
-              "objDist","pxPitch","mmPerPxNominal","focalPxNominal"):
-        v = getattr(cfg, k)
-        print(f"    {k:<16}{v:12.6f}")
-    print(f"    {'mmPerPx@specT':<16}{(cfg.sObj(cfg.specTden)-cfg.lensF)/cfg.focalPxNominal:12.6f}"
-          f"   (um/px: {(cfg.sObj(cfg.specTden)-cfg.lensF)/cfg.focalPxNominal*1000:.3f})")
-    print("  BUDGET")
-    for lbl, dim, tgt in (("length", cfg.specL, 25.0), ("width", cfg.couponW, 20.0)):
-        print(f"    {lbl:<8}{tgt:5.1f} um on {dim:7.2f} mm = {tgt/1000/dim*1e6:6.0f} ppm")
-    print(f"    specT sensitivity: {1/(cfg.objDist-cfg.lensF)*1e6:.0f} ppm per mm of "
-          f"thickness error")
 
 
 def main() -> None:

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-chords.py - length and width sampled ACROSS the coupon, not just the single
-             fitted figure gauge.py reports.
+chords.py - length and width sampled across the coupon.
 
     python3 chords.py --image shot.png --auto-roi --thickness 5.5
     python3 chords.py --image shot.png --auto-roi --thickness 5.5 -n 30 --csv prof.csv
@@ -9,41 +8,6 @@ chords.py - length and width sampled ACROSS the coupon, not just the single
 
 Imports gauge.py for capture, ROI, edge finding and calibration. Nothing here
 changes gauge.py -- this is a second view of the same scan data.
-
-WHAT A CHORD IS
-    Every row of the scan already yields a left and a right subpixel edge. Their
-    separation is the coupon's extent along that row -- one horizontal chord.
-    gauge.py fits two lines through all of them and reports one number, which
-    throws the variation away. This keeps it.
-
-        rows    -> horizontal chords -> the long dimension at each height
-        columns -> vertical chords   -> the short dimension at each position
-
-SINGLE ROW OR A BAND
-    One row carries the full per-row noise, ~0.04 px, about 2.5 um at 58 um/px.
-    Usable, but 20x worse than the fitted line, because a line through N rows
-    averages the noise down as 1/sqrt(N).
-
-    A band recovers most of that: averaging over B rows divides the noise by
-    sqrt(B) while staying localised to B rows of the coupon. The band is
-    specified in MILLIMETRES so it means the same thing at any resolution or
-    standoff. Default 3 mm -- far finer than pressed wood varies.
-
-    --band 0 disables banding and gives the raw per-row chords.
-
-WHY THE ENDS GET TRIMMED
-    On a tilted coupon, a horizontal line near the top does not cross both long
-    edges -- it clips a corner, and the two "edges" it finds are a short corner
-    chord. Those chords are real measurements of the wrong thing. The first and
-    last few percent of each axis are therefore dropped. Raise --trim if the
-    profile still turns down at both ends; that shape is the tell.
-
-TILT STILL COMES FROM THE FITTED LINES
-    A horizontal chord is only the true length if the coupon is square to the
-    frame; tilted by theta it is longer by 1/cos(theta). A single chord has no
-    slope to correct with, so the angle comes from the global edge fit. That is
-    what the fit is good for, which is why this augments gauge.py rather than
-    replacing it.
 """
 
 import argparse
@@ -85,11 +49,6 @@ class Profile(NamedTuple):
 
 def _robust_mean(v):
     """Mean after dropping points more than 3 MAD from the median.
-
-    A band is a small sample, so one bad row -- a nick, a dust speck -- shifts a
-    plain mean noticeably. Rejecting on median absolute deviation rather than
-    standard deviation matters because with only a few dozen points a single
-    outlier inflates sigma enough to survive its own test.
     """
     v = np.asarray(v, float)
     if v.size < 4:
@@ -130,12 +89,6 @@ def decompose(pos, edge, order=3):
 def profile_axis(pos, lo, hi, cfg, mmpx, n_chords, band_mm, trim_frac, label,
                  order=3):
     """Build one set of chords from a scan's (position, low edge, high edge).
-
-    The perpendicular correction is taken from the LOCAL direction of the
-    specimen's centreline, not from one global slope. On a curved or wavy edge
-    the two differ, and using a global slope quietly reports the wrong quantity:
-    the chord is only the true width when it is corrected by the cosine of the
-    angle at THAT point.
     """
     centre = 0.5 * (lo + hi)
     # A low-order polynomial through the centreline: smooth enough to be a stable

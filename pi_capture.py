@@ -9,39 +9,6 @@ gauge.py reads directly.
     python3 pi_capture.py -o shot.png             one frame
     python3 pi_capture.py -o shot.png --exposure 8000 --gain 1.0
     python3 pi_capture.py -o run --frames 20      run_000.png .. run_019.png
-
-WHY RAW, NOT JPEG
-    The IMX477 is a colour sensor under a Bayer filter. The normal pipeline
-    demosaics -- it INTERPOLATES across neighbouring pixels to invent the two
-    missing colours at every site. That interpolation runs straight across the
-    step edge you are measuring, and its behaviour depends on the edge's phase
-    relative to the Bayer grid. The result is a subpixel bias that varies with
-    where the coupon happens to sit, which is exactly the error that hides
-    inside excellent repeatability.
-
-    Raw Bayer has no interpolation. Every value is a real measurement.
-
-WHY THE GREEN PLANE
-    In a Bayer tile of four sites, two are green, one red, one blue. Taking
-    green alone gives a regular grid of TRUE samples at half resolution:
-    2028 x 1520. That is still ~10x more resolution than your error budget
-    needs, and it costs nothing you cannot spare.
-
-    The two greens sit on opposite diagonals of the tile, so averaging them
-    lands the sample at the tile CENTRE -- symmetric, therefore no edge bias.
-    It also cancels the Gr/Gb gain imbalance most sensors have, and gains
-    sqrt(2) in signal-to-noise for free.
-
-    Pair this with a green backlight and you are using the wavelength where
-    half the sensor's pixels live, with no chromatic aberration in the lens.
-
-WHAT IS DELIBERATELY OFF
-    Auto-exposure, auto-gain and auto-white-balance are all disabled. Each is a
-    content-dependent transform: it changes pixel values as a function of what
-    is in the scene, so the measured edge moves when the scene moves. Raw
-    capture also bypasses lens shading correction, sharpening and denoise
-    entirely -- they are applied downstream of the sensor and never touch this
-    data.
 """
 
 import argparse
@@ -106,11 +73,6 @@ def open_camera(args):
     unpacked = fmt.replace("_CSI2P", "")
 
     if getattr(args, "live", False):
-        # ONE configuration carrying both streams. The raw stream still drives the
-        # sensor mode, so the preview is a downscale of exactly the frame the
-        # measurement will use -- pressing Capture changes nothing about the
-        # optics or the sensor. Reconfiguring between preview and capture would
-        # re-run the sensor setup and invalidate that guarantee.
         cfg = picam2.create_video_configuration(
             main={"size": (800, 600), "format": "RGB888"},
             raw={"size": want, "format": unpacked},
@@ -126,11 +88,6 @@ def open_camera(args):
     exposure, gain = args.exposure, args.gain
 
     if args.auto_once:
-        # Let auto-exposure choose ONCE, read back what it picked, then pin it.
-        # Autoexposure is unusable as a running mode -- it responds to the scene,
-        # so a darker coupon gets a longer exposure and the frames stop being
-        # comparable. But its opinion is a good starting point, and beats
-        # guessing blind.
         picam2.set_controls({"AeEnable": True, "AwbEnable": False})
         picam2.start()
         time.sleep(2.5)                        # let the AE loop converge
@@ -154,17 +111,7 @@ def open_camera(args):
 
 
 def capture(picam2, fmt, size) -> np.ndarray:
-    """Grab one raw frame and return the green plane as float32.
-
-    picamera2 hands raw streams back as a BYTE buffer, so a 16-bit frame arrives
-    either as (h, width*2) uint8 or as (h, w, 2) uint8 depending on version.
-    Neither is the pixel data until it is reinterpreted -- reading it as uint8
-    would silently give you the low byte of every pixel, which looks like a
-    plausible noisy image and is completely wrong.
-
-    The buffer is also STRIDE PADDED: rows are rounded up to a hardware
-    alignment, so the array is wider than the image. Crop to the configured
-    size rather than trusting the array shape."""
+    """Grab one raw frame and return the green plane as float32."""
     w, h = size
     raw = picam2.capture_array("raw")
 
@@ -183,11 +130,7 @@ def capture(picam2, fmt, size) -> np.ndarray:
 
 
 def infer_bits(g: np.ndarray) -> int:
-    """Bit depth from the DATA, not the format name.
-
-    A 12-bit sensor delivered in a 16-bit container may be right-justified
-    (0..4095) or left-justified (0..65535), and the format string says only
-    "16" either way. Guessing wrong makes every diagnostic threshold meaningless.
+    """Bit depth.
     """
     m = float(g.max())
     for b in (8, 10, 12, 14, 16):
@@ -271,17 +214,6 @@ poll();
 
 def live_server(picam2, fmt, size, exposure, args):
     """Serve an MJPEG preview with a Capture button.
-
-    Runs over the network, so it works whether or not a monitor is attached to
-    the Pi -- open it from the laptop browser. The live panel exists to set up
-    the two things that decide whether a measurement is worth anything:
-
-      bright field / clipped -- set the exposure. Clipping truncates the
-        gradient on the bright side only, so both edges walk INWARD and the
-        coupon reads undersize, silently, with excellent repeatability.
-      focus (edge px) -- turn the lens until this bottoms out, then lock it.
-        Measured on the downscaled preview, so treat it as a relative
-        indicator; the captured frame reports the true figure.
     """
     import http.server, io, json, socket, threading
 
@@ -462,10 +394,6 @@ def main() -> None:
         return
 
     if a.sweep:
-        # Walk the exposure and report what matters: contrast, and whether the
-        # bright field has started to clip. Clipping is the failure to avoid --
-        # it truncates the gradient on the bright side only, so both edges walk
-        # inward and the coupon reads UNDERSIZE with excellent repeatability.
         print(f"\n  {'exposure':>10}{'95th pct':>11}{'contrast':>11}{'clipped':>10}  verdict")
         best = None
         for e in [int(exposure * k) for k in (0.25, 0.5, 1, 2, 4, 8)]:

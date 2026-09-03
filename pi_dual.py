@@ -7,46 +7,6 @@ pi_dual.py -- two HQ cameras: bottom for length and width, side for thickness.
 
     desktop      http://<pi>:8080
     touchscreen  http://<pi>:8080/touch
-
-TWO GEOMETRIES, ONE FLAG
-    --plane-offset decides whether the two cameras are coupled or independent,
-    and it is the single most consequential setting here.
-
-    WITHOUT IT (a coupon resting on an opaque platform, camera above): the
-    silhouette is cast by the coupon's TOP face, which floats one thickness above
-    the platform. The bottom camera's scale is (A0 - specT)/focalPx0, so it NEEDS
-    the thickness, and the side camera must run first to supply it. One
-    direction, no iteration, but the bottom view cannot report anything until the
-    side view is calibrated and working.
-
-    WITH IT (the "chair" -- two transparent plates at 90 degrees, camera below):
-    the silhouette-forming face RESTS ON the glass, so it is on a fixed plane for
-    every specimen. specT leaves the scale law altogether and --plane-offset 0
-    makes the two cameras fully independent: either can be calibrated first,
-    either reports on its own, and thickness becomes something you MEASURE rather
-    than something you must supply.
-
-    That is the whole point of the chair geometry, and it removes far more than
-    the coupling: the thickness correction was 12210 ppm at 5.5 mm and 59940 ppm
-    at 27 mm, against a 125 ppm length budget.
-
-WHY THICKNESS IS NEVER ASSUMED
-    If the side camera fails, this refuses to report a bottom-camera measurement
-    rather than falling back to a nominal thickness. At 775 mm standoff a 1 mm
-    thickness error is 1290 ppm -- ten times the length budget -- and it produces
-    a number that looks entirely reasonable and repeats perfectly.
-
-TWO CALIBRATIONS, NEVER SHARED
-    focalPx is in PIXELS and belongs to one lens at one standoff at one
-    resolution. The two cameras keep separate files. Mixing them would rescale a
-    measurement by the ratio of two unrelated optical systems.
-
-THE FREE CROSS-CHECK
-    The side camera also sees the coupon's LENGTH. That is a second, independent
-    measurement of a dimension the bottom camera already gives you -- different
-    lens, different calibration, different distortion. Agreement is real evidence
-    both calibrations are sound; a drift in the difference localises the fault to
-    one camera. It costs nothing to compute, so it is always logged.
 """
 
 import argparse
@@ -70,12 +30,7 @@ import gauge as G
 # ------------------------------------------------------------------ camera --
 
 class Cam:
-    """The HARDWARE only: one sensor, its streams, its preview buffer.
-
-    Deliberately holds no calibration. Which physical camera looks at the side
-    of the coupon is a wiring question, and wiring gets swapped -- so the
-    measurement configuration lives in Role below and is bound to a Cam at
-    runtime rather than baked into it.
+    """Hardware only: one sensor, its streams, its preview buffer.
     """
 
     def __init__(self, index, exposure, size=(4056, 3040)):
@@ -112,13 +67,8 @@ class Cam:
 
 
 class Role:
-    """A measurement JOB -- bottom or side -- with its own standoff, ROI and
+    """A measurement job -- bottom or side -- with its own standoff, ROI and
     calibration, pointed at whichever Cam currently performs it.
-
-    Swapping the cameras therefore rebinds `self.cam` and touches nothing else.
-    The calibration stays with the ROLE, not the sensor, which is what you want:
-    effDist, focalPx and the ROI all describe a viewpoint, and the viewpoint is
-    what the two cameras exchange when the cables are the other way round.
     """
 
     def __init__(self, name, eff_dist, roi, prominence, calib_file, max_resid):
@@ -151,12 +101,6 @@ class Role:
 
     def find_roi(self, img):
         """Resolve the ROI and remember it for the preview overlay.
-
-        Stored here rather than after a successful measurement, because the box
-        is most useful exactly when the measurement FAILS -- "0 valid lines" and
-        "edge peaks too weak" are both usually a box in the wrong place, and
-        seeing it is the difference between diagnosing that and guessing at it.
-        Cleared on failure so the overlay never shows a box that is not in use.
         """
         self.last_w = img.shape[1]
         try:
@@ -456,12 +400,6 @@ def main():
     time.sleep(1.5)
 
     hist = collections.deque(maxlen=a.window)
-    # The most recent thickness cam1 produced, independent of whether cam0 is
-    # calibrated. Calibrating cam0 must use the thickness the artefact ACTUALLY
-    # has: calibrate at 0 and measure at 12 mm and every length is short by
-    # (A-12)/A -- 1.5% here, a clean 196.9 for a true 200. The rolling history
-    # cannot serve this, because it only fills once BOTH cameras are calibrated,
-    # which is never true while you are calibrating the first one.
     latest = {"thickness": None}
     snap = {"json": json.dumps({"rate": 0.0}).encode(), "row": None}
 
@@ -538,14 +476,6 @@ def main():
             except Exception as e:
                 d["err1"] = str(e)[:90]
 
-            # --- BOTTOM, using the measured thickness. Never a nominal one: at
-            # 775 mm a 1 mm thickness error is 1290 ppm, ten times the length
-            # budget, and the result looks perfectly reasonable.
-            # A FIXED plane means the bottom view needs nothing from the side
-            # view. Otherwise it takes the measured thickness -- and never a
-            # nominal one, because at 775 mm a 1 mm thickness error is 1290 ppm,
-            # ten times the length budget, on a result that looks perfectly
-            # reasonable and repeats perfectly.
             if a.plane_offset is not None:
                 specT = a.plane_offset
             else:
@@ -667,17 +597,7 @@ def main():
                     return self._send(f"calibration failed: {e}".encode())
 
             if self.path == "/profile":
-                # Profile BOTH viewpoints. The side camera's small-axis profile is
-                # the thickness along the coupon -- for volume, and therefore for
-                # density, that profile integrated is the honest input, not a
-                # single thickness multiplied by a single length and width.
                 out, rows = [], []
-                # Each view profiles INDEPENDENTLY. The bottom view's offset only
-                # affects the millimetre scale, never the chord shape or the
-                # pixel spans, so there is no reason to withhold a profile just
-                # because the side view is not working. With --plane-offset there
-                # is no dependency at all; without it, an unavailable thickness
-                # costs the millimetre conversion and nothing else.
                 if a.plane_offset is not None:
                     t, tnote = a.plane_offset, ""
                 elif latest["thickness"] is not None:
