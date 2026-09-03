@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-chords.py -- length and width sampled ACROSS the coupon, not just the single
+chords.py - length and width sampled ACROSS the coupon, not just the single
              fitted figure gauge.py reports.
 
     python3 chords.py --image shot.png --auto-roi --thickness 5.5
