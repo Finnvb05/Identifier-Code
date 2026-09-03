@@ -1,0 +1,24 @@
+# --- calibration: machine-specific, and actively dangerous to share ---
+calibration.json          # pi_measure.py, gauge.py (single camera)
+calib_bottom.json         # pi_dual.py, bottom view
+calib_side.json           # pi_dual.py, side view
+calib_cam0.json           # earlier pi_dual.py naming
+calib_cam1.json
+dual_state.json           # which sensor is bottom vs side
+
+# --- measurement output ---
+*.csv
+runs.csv
+prof.csv
+
+# --- captured frames ---
+*.png
+*.jpg
+*.jpeg
+cap_*.png
+photo_*.jpg
+frame*.png
+
+# --- python ---
+__pycache__/
+*.pyc
