@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-r"""
-Code for gauging the length/width of a visible coupon in a backlit image. The coupon is assumed to be dark on a bright
+"""
+Code for gauging the length/width of a visible coupon in a backlit image. The coupon
+is assumed to be dark on a bright background.
+
+    pip install numpy opencv-python requests
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ MAX_RESID_FRAC = 0.01           # default ceiling on the edge fit residual,
 
 @dataclass
 class Config:
+    """Names match PaperSteel_Onshape_Variables.csv."""
 
     host: str = "192.168.1.50"
 
@@ -38,7 +42,6 @@ class Config:
     couponGap: float = 5.0          # saw kerf + trim allowance between coupons
 
     # This coupon's MEASURED thickness -- not specTden, which is only the nominal.
-    # At objDist 462 mm, 1 mm of error here is 2200 ppm: 17x the length budget.
     specT: float = 5.5
 
     # --- datum stack (CSV) ---------------------------------------------------
@@ -61,15 +64,11 @@ class Config:
                                     # to measure. Expect ~focalPxNominal.
     calibSObj: float = 0.0          # sObj at calibration, recorded to detect drift
 
-    # Effective distance A = objDist - lensF, i.e. platform-to-equivalent-pinhole with
-    # the focal length already folded in. 0 = derive it from the CAD optics above.
-    # --calib-stack MEASURES it, which is what you want on any rig where lensF and
-    # lensPP are unknown (an ESP32-CAM module, or any lens without a datasheet).
+    # Effective distance A = objDist - lensF (platform to equivalent pinhole).
     effDist: float = 0.0
 
     # --- region of interest --------------------------------------------------
-    # Must contain the coupon and nothing else: the row scan assumes one dark object
-    # per line. --auto-roi will locate it.
+    # Must contain the coupon and nothing else.
     roi: tuple[int, int, int, int] = (400, 300, 1200, 900)
 
     # --- sensor --------------------------------------------------------------
@@ -114,8 +113,13 @@ class Config:
     # ---- DERIVED, mirroring the CSV formulas --------------------------------
     @property
     def couponW(self) -> float:
-        """Coupon width."""
+        """Coupon width that actually fits -- derived from the panel, not chosen."""
         return (self.specW - (self.couponN - 1) * self.couponGap) / self.couponN
+
+    @property
+    def zSpec(self) -> float:
+        """SPECIMEN PLANE -- the primary measurement datum."""
+        return self.zPanBot + self.panT + self.ribH
 
     @property
     def fovL(self) -> float:
@@ -136,7 +140,7 @@ class Config:
 
     @property
     def objDist(self) -> float:
-        """Principal plane -> specimen PLANE. Equals workDist + lensPP."""
+        """Principal plane -> specimen PLANE."""
         return self.lensF * (1 + 1 / self.mag)
 
     @property
@@ -146,8 +150,14 @@ class Config:
 
     @property
     def mmPerPxNominal(self) -> float:
-        """Scale at the specimen PLANE. The scale actually used sits one specT higher."""
+        """Scale at the specimen PLANE."""
         return self.fovL / self.pixelsL
+
+    @property
+    def armZ(self) -> float:
+        """Camera arm underside -- derived, so moving the specimen plane moves the
+        camera."""
+        return self.zSpec + self.workDist + self.camStack
 
     @property
     def focalPxNominal(self) -> float:
@@ -155,7 +165,7 @@ class Config:
         return self.lensF / self.pxPitch
 
     def sObj(self, thickness: Optional[float] = None) -> float:
-        """Principal plane --> the silhouette-forming top face of the coupon."""
+        """Principal plane -> the silhouette-forming TOP face of the coupon."""
         t = self.specT if thickness is None else thickness
         s = self.objDist - t
         if s <= self.lensF:
@@ -164,12 +174,7 @@ class Config:
 
     @property
     def effDistance(self) -> float:
-        """A = objDist - lensF. The whole optical chain reduces to this one number.
-
-        Thin lens: m = lensF/(s - lensF), so mm/px = pxPitch/m = (s - lensF)/focalPx.
-        Substituting s = objDist - t gives mm/px = (A - t)/focalPx, with A absorbing
-        both the standoff and the focal length. Two unknowns, A and focalPx, and
-        --calib-stack solves for both from images alone."""
+        """A = objDist - lensF."""
         return self.effDist if self.effDist > 0 else self.objDist - self.lensF
 
     def mmPerPx(self, thickness: Optional[float] = None) -> float:
@@ -184,6 +189,8 @@ class Config:
 
 # ============================================================== camera ======
 
+# Every one of these is a CONTENT-DEPENDENT transform: it changes pixel values as a
+# function of what is in the scene.
 CAM = [("awb", 0), ("awb_gain", 0), ("wb_mode", 0), ("aec", 0), ("aec2", 0),
        ("ae_level", 0), ("agc", 0), ("agc_gain", 0), ("gainceiling", 0),
        ("bpc", 0), ("wpc", 0), ("raw_gma", 0), ("lenc", 0), ("dcw", 0),
@@ -215,7 +222,8 @@ def frame(cfg: Config) -> np.ndarray:
 
 
 def load(path: str) -> np.ndarray:
-    """Read an image file as float32"""
+    """Read an image FILE as float32 -- same output as frame(), so every downstream
+    stage is identical whether the pixels came from a camera or from disk."""
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError(f"could not read {path}")
@@ -223,15 +231,15 @@ def load(path: str) -> np.ndarray:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     img = img.astype(np.float32)
     if img.max() > 255:
-        # 12-bit raw sits in a 16-bit container; scale by the real range used,
-        # not by 65535, or a 12-bit frame would come out 16x too dark.
+        # 12-bit raw sits in a 16-bit container; scale by the real range used, not by
+        # 65535, or a 12-bit frame would come out 16x too dark.
         bits = 16 if img.max() > 4095 else (12 if img.max() > 1023 else 10)
         img *= 255.0 / (2 ** bits - 1)
     return img
 
 
 def _peaks(prof: np.ndarray, k: int, sep: int) -> list[tuple[int, float]]:
-    """Top k peaks by greedy non-maximum suppression. Dependency-free."""
+    """Top k peaks by greedy non-maximum suppression."""
     p = prof.copy().astype(np.float64)
     out = []
     for _ in range(k):
@@ -243,10 +251,32 @@ def _peaks(prof: np.ndarray, k: int, sep: int) -> list[tuple[int, float]]:
     return out
 
 
+class Reference:
+    """An EMPTY-FIXTURE frame, used to divide out everything that never changes."""
+
+    def __init__(self, ref, opaque=0.15, ring_px=3):
+        self.ref = np.asarray(ref, np.float32)
+        self.bright = float(np.percentile(self.ref, 95))
+        self.mask = self.ref < opaque * self.bright
+        k = np.ones((2 * ring_px + 1, 2 * ring_px + 1), np.uint8)
+        grown = cv2.dilate(self.mask.astype(np.uint8), k).astype(bool)
+        self.ring = grown & ~self.mask
+        self.masked_frac = float(self.mask.mean())
+
+    def apply(self, img):
+        """Return (flattened image, touch count)."""
+        if img.shape != self.ref.shape:
+            raise ValueError(f"reference is {self.ref.shape[1]}x{self.ref.shape[0]}, "
+                             f"frame is {img.shape[1]}x{img.shape[0]} - recapture it")
+        out = img * (self.bright / np.maximum(self.ref, 1.0))
+        out[self.mask] = self.bright
+        touch = int((out[self.ring] < 0.5 * self.bright).sum())
+        return out.astype(np.float32), touch
+
+
 def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
              min_contrast_hint: float = 20.0) -> tuple[int, int, int, int]:
-    """Locate the specimen and return an ROI around it, from gradient projections.
-    """
+    """Locate the specimen and return an ROI around it, from gradient projections."""
     H, W = img.shape
     sm = cv2.GaussianBlur(img, (0, 0), 2.0)
     gx = cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3)
@@ -258,6 +288,8 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
         edge = max(3, n // 50)                       # ignore frame-border artefacts
         fall[:edge] = fall[n - edge:] = 0
         rise[:edge] = rise[n - edge:] = 0
+
+        # Two different jobs, previously conflated.
         nms = max(3, n // 200)
         pair = max(3, n // 400)
         F, R = _peaks(fall, 6, nms), _peaks(rise, 6, nms)
@@ -274,6 +306,7 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
                     best = (xf, xr, score)
 
         if best is not None:
+            # Take the OUTER foot of each gradient hump, not its peak.
             xf, xr, sc = best
             f_lo, r_hi = xf, xr
             while f_lo > edge and fall[f_lo - 1] > 0.2 * fall[xf]:
@@ -292,6 +325,7 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
     x0, x1, px = locate(gx, 0, W)
     y0, y1, py = locate(gy, 1, H)
     if min(px, py) < min_prominence:
+        # Name the axis.
         axis = "X (left/right edges)" if px < py else "Y (top/bottom edges)"
         raise RuntimeError(
             f"edge peaks too weak on {axis}: prominence X {px:.1f}, Y {py:.1f}, "
@@ -302,7 +336,7 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
     box = (int(max(0, x0 - margin)), int(max(0, y0 - margin)),
            int(min(W, x1 + margin)), int(min(H, y1 + margin)))
 
-    # Confirm the box actually contains a dark object.
+    # Confirm the box actually contains a DARK OBJECT.
     bx0, by0, bx1, by1 = box
     inner = img[by0:by1, bx0:bx1]
     if inner.size:
@@ -325,9 +359,8 @@ def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
 # ====================================================== subpixel edges ======
 
 def _row(prof: np.ndarray, cfg: Config) -> Optional[tuple[float, float]]:
-    """Locate the left and right edge of one dark-on-bright intensity profile,
-    to a fraction of a pixel.
-    """
+    """Locate the left and right edge of one dark-on-bright intensity profile, to a
+    fraction of a pixel."""
     lo, hi = float(prof.min()), float(prof.max())
     if hi - lo < cfg.minContrast:
         return None                                # no specimen on this line
@@ -378,15 +411,10 @@ def grad_width(img: np.ndarray, cfg: Config, n: int = 16) -> Optional[float]:
 
 
 def scan(roi: np.ndarray, cfg: Config) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply _row to every horizontal line of the ROI.
-
-    Returns three parallel arrays: (row index, left edge x, right edge x), containing
-    only the lines where detection succeeded. Rows that fail are dropped rather than
-    filled, so a partial obstruction costs coverage but never corrupts the fit."""
+    """Apply _row to every horizontal line of the ROI."""
     img = cv2.GaussianBlur(roi, (0, 0), cfg.sigma) if cfg.sigma > 0 else roi
 
-    # Size the centroid window once per image from the measured edge width. Clamped
-    # below so it never degenerates, and above so it cannot reach the opposite edge.
+    # Size the centroid window once per image from the measured edge width.
     if cfg.halfwin <= 0:
         gw = grad_width(img, cfg)
         cfg = replace(cfg, halfwin=int(np.clip(round(cfg.halfwinK * gw), 3, 30))
@@ -400,8 +428,7 @@ def scan(roi: np.ndarray, cfg: Config) -> tuple[np.ndarray, np.ndarray, np.ndarr
 
 
 def valid_band(pos, lo, hi):
-    """Rows where BOTH detected edges lie on the specimen's end faces.
-    """
+    """Rows where BOTH detected edges lie on the specimen's END faces."""
     def run_of(v):
         d = np.abs(np.diff(v))
         med = float(np.median(d)) if d.size else 0.0
@@ -433,10 +460,7 @@ def valid_band(pos, lo, hi):
 # ============================================================ line fit ======
 
 class Line(NamedTuple):
-    """An edge modelled as  x = slope * y + icept.
-
-    Solved in this form rather than y = mx + c because a near-vertical edge has an
-    infinite slope in the usual parameterisation."""
+    """An edge modelled as x = slope * y + icept."""
     slope: float
     icept: float
     rms: float      # residual RMS in px -- how straight the edge actually is
@@ -444,7 +468,7 @@ class Line(NamedTuple):
 
 
 def fit(y: np.ndarray, x: np.ndarray, k: float = 3.0) -> Line:
-    """Least-squares line with outlier rejection."""
+    """Least-squares line through the subpixel edge points, with outlier rejection."""
     keep = np.ones(y.size, bool)
     m = c = 0.0
     for _ in range(3):
@@ -454,10 +478,7 @@ def fit(y: np.ndarray, x: np.ndarray, k: float = 3.0) -> Line:
                                x[keep], rcond=None)[0]
         r = x - (m * y + c)                                   # residuals, ALL points
         s = 1.4826 * np.median(np.abs(r[keep] - np.median(r[keep])))
-        # Floor the scale. A near-perfect edge gives MAD ~ 0, and a 3-sigma gate around
-        # zero rejects EVERY point -- the rms then averages an empty array and returns
-        # nan. Synthetic data hits this immediately; noisy real data hides it until it
-        # doesn't. 1 millipixel is far below anything the estimator can resolve.
+        # Floor the scale.
         s = max(s, 1e-3)
         new = np.abs(r) < k * s
         # Never accept a pass that discards most of the data: that is a sign the model
@@ -492,8 +513,7 @@ class Result(NamedTuple):
 
 def _check_fit(a: Line, b: Line, span: float, what: str,
                frac: float = MAX_RESID_FRAC) -> None:
-    """Refuse to return a faulty number.
-    """
+    """Refuse to return a number when the straight-line model has clearly failed."""
     lim = max(3.0, frac * span)
     worst = max(a.rms, b.rms)
     if worst > lim:
@@ -532,8 +552,6 @@ def measure(img: np.ndarray, cfg: Config, thickness: Optional[float] = None) -> 
     _check_fit(left, right, w_px, "rows", cfg.maxResidualFrac)
 
     # LENGTH: identical problem rotated 90 degrees, so transpose and reuse everything.
-    # ascontiguousarray because .T only flips strides, and the row-wise slicing in
-    # scan() is far slower on a non-contiguous view.
     ty, tl, tr = scan(np.ascontiguousarray(roi.T), cfg)
     if cfg.trimCorners:
         a, b = valid_band(ty, tl, tr)
@@ -550,11 +568,10 @@ def measure(img: np.ndarray, cfg: Config, thickness: Optional[float] = None) -> 
     l_px = gap(top, bot, float(np.median(ty)))
     _check_fit(top, bot, l_px, "columns", cfg.maxResidualFrac)
 
-    # PIXELS -> MILLIMETRES. See the module docstring for why thickness subtracts.
-    # PIXELS -> MILLIMETRES. Thin lens, not pinhole: see the module docstring for why
-    # the lensF term matters (321 ppm at specTden, 1655 ppm at specTraw).
+    # PIXELS -> MILLIMETRES.
     mmpx = cfg.mmPerPx(thickness)
 
+    # The row scan gives the HORIZONTAL extent and the column scan the VERTICAL one.
     if cfg.autoOrient and w_px > l_px:
         w_px, l_px = l_px, w_px
 
@@ -583,13 +600,12 @@ def run(cfg: Config, thickness: Optional[float]) -> None:
     print(f"\n  n = {len(w)}/{cfg.nFrames}   scale {r.um_per_px:.4f} um/px")
     print(f"  WIDTH   {w.mean():8.4f} mm   1s {w.std(ddof=1)*1000:6.1f} um")
     print(f"  LENGTH  {l.mean():8.4f} mm   1s {l.std(ddof=1)*1000:6.1f} um")
+    # The spread is REPEATABILITY, not accuracy.
     print("  (repeatability only - averaging does nothing to bias)")
 
 
 def calibrate(known_mm: float, height_mm: float, cfg: Config) -> None:
-    """Solve focalPx from an artefact of known width at a known height above zSpec:
-
-        focalPx = width_px * (s_cal - lensF) / known_mm"""
+    """Solve focalPx from an artefact of known width at a known height."""
     s_cal = cfg.effDistance - height_mm      # A - h, the only distance that matters
     cfg.focalPx = 1.0                 # placeholder: measure() refuses on 0, and only
                                       # width_px is wanted here, so the scale is moot
@@ -618,7 +634,7 @@ def calibrate(known_mm: float, height_mm: float, cfg: Config) -> None:
 
 def calib_stack(pairs: list[tuple[str, float]], known_mm: float,
                 cfg: Config) -> tuple[float, float]:
-    """Solve optical unknowns from images of one artefact at several heights."""
+    """Solve BOTH optical unknowns from images of one artefact at several heights."""
     if len(pairs) < 2:
         raise ValueError("need at least two heights")
 
@@ -671,10 +687,7 @@ def scale_focal(focalPx: float, calib_width: int, image_width: int) -> float:
 
 
 def load_calib(path: str, cfg: Config) -> bool:
-    """Apply a stored calibration. Returns True if one was applied.
-
-    Loudly, never silently: a measurement whose scale came from an unseen file is
-    exactly the kind of result that gets trusted when it should not be."""
+    """Apply a stored calibration."""
     try:
         with open(path) as fh:
             rec = json.load(fh)
@@ -684,8 +697,7 @@ def load_calib(path: str, cfg: Config) -> bool:
     stored = float(rec["effDist"])
     print(f"  calibration from {path}: focalPx {cfg.focalPx:.2f}, "
           f"effDist {stored:.1f} mm, {rec.get('when', 'undated')}")
-    # effDist is part of the calibration geometry. If the camera has since moved,
-    # the stored focalPx no longer describes this setup.
+    # effDist is part of the calibration geometry.
     if cfg.effDist > 0 and abs(cfg.effDist - stored) > 0.5:
         print(f"  >> WARNING: --eff-dist {cfg.effDist:.1f} differs from the "
               f"calibrated {stored:.1f} mm.")
@@ -702,8 +714,7 @@ LOG_FIELDS = ["when", "image", "length_mm", "width_mm", "length_px", "width_px",
 
 
 def log_row(path: str, cfg: Config, r: "Result", image: str, note: str = "") -> None:
-    """Append one measurement to a CSV, creating it with a header if new.
-    """
+    """Append one measurement to a CSV, creating it with a header if new."""
     new = not os.path.exists(path) or os.path.getsize(path) == 0
     with open(path, "a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=LOG_FIELDS)
@@ -728,7 +739,7 @@ def log_row(path: str, cfg: Config, r: "Result", image: str, note: str = "") -> 
 
 
 def diagnose(img: np.ndarray, cfg: Config) -> None:
-    """Report rejected rows"""
+    """Report WHY rows are being rejected, instead of just how many."""
     x0, y0, x1, y1 = cfg.roi
     H, W = img.shape
     if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
@@ -782,12 +793,7 @@ def diagnose(img: np.ndarray, cfg: Config) -> None:
 
 
 def overlay(path: str, cfg: Config) -> None:
-    """Dump an annotated frame. Look at this before trusting any number.
-
-    Check: the ROI box contains the specimen and nothing else; the detected edge dots
-    run cleanly down both sides with no gaps or excursions; the row count is close to
-    the full ROI height. Also check the histogram -- the bright field should sit near
-    200 DN, not clipped at 255."""
+    """Dump an annotated frame."""
     img = frame(cfg)
     x0, y0, x1, y1 = cfg.roi
     y, xl, xr = scan(img[y0:y1, x0:x1], cfg)
@@ -799,6 +805,27 @@ def overlay(path: str, cfg: Config) -> None:
     cv2.imwrite(path, vis)
     L, R = fit(y, xl), fit(y, xr)
     print(f"{path}: {L.n}/{y1-y0} rows, edge RMS {L.rms:.3f}/{R.rms:.3f} px")
+
+
+def geometry(cfg: Config) -> None:
+    """Print the derived chain."""
+    print("  INPUTS")
+    for k in ("specL","specW","specTraw","specTden","couponN","couponGap",
+              "zPanBot","panT","ribH","zBacklight","fovMargin","sensorW","sensorH",
+              "pixelsL","lensF","lensPP","camStack"):
+        print(f"    {k:<12}{getattr(cfg,k)}")
+    print("  DERIVED")
+    for k in ("couponW","zSpec","fovL","fovW","mag","workDist","armZ",
+              "objDist","pxPitch","mmPerPxNominal","focalPxNominal"):
+        v = getattr(cfg, k)
+        print(f"    {k:<16}{v:12.6f}")
+    print(f"    {'mmPerPx@specT':<16}{(cfg.sObj(cfg.specTden)-cfg.lensF)/cfg.focalPxNominal:12.6f}"
+          f"   (um/px: {(cfg.sObj(cfg.specTden)-cfg.lensF)/cfg.focalPxNominal*1000:.3f})")
+    print("  BUDGET")
+    for lbl, dim, tgt in (("length", cfg.specL, 25.0), ("width", cfg.couponW, 20.0)):
+        print(f"    {lbl:<8}{tgt:5.1f} um on {dim:7.2f} mm = {tgt/1000/dim*1e6:6.0f} ppm")
+    print(f"    specT sensitivity: {1/(cfg.objDist-cfg.lensF)*1e6:.0f} ppm per mm of "
+          f"thickness error")
 
 
 def main() -> None:

@@ -4,9 +4,6 @@ pi_dual.py -- two HQ cameras: bottom for length and width, side for thickness.
 
     python3 pi_dual.py --eff-dist0 775 --eff-dist1 300
     python3 pi_dual.py --eff-dist0 775 --eff-dist1 300 --log runs.csv
-
-    desktop      http://<pi>:8080
-    touchscreen  http://<pi>:8080/touch
 """
 
 import argparse
@@ -23,15 +20,14 @@ import cv2
 import numpy as np
 from picamera2 import Picamera2
 
-import chord_measure as C
+import chords as C
 import gauge as G
 
 
 # ------------------------------------------------------------------ camera --
 
 class Cam:
-    """Hardware only: one sensor, its streams, its preview buffer.
-    """
+    """The HARDWARE only: one sensor, its streams, its preview buffer."""
 
     def __init__(self, index, exposure, size=(4056, 3040)):
         self.index = index
@@ -40,8 +36,8 @@ class Cam:
         self.pc = Picamera2(index)
         self.pc.configure(self.pc.create_video_configuration(
             main={"size": size, "format": "RGB888"},
-            # 64-aligned, so the ISP adds no stride padding for the preview to
-            # misread as picture.
+            # 64-aligned, so the ISP adds no stride padding for the preview to misread
+            # as picture.
             lores={"size": (512, 384), "format": "YUV420"},
             buffer_count=2,
         ))
@@ -67,12 +63,15 @@ class Cam:
 
 
 class Role:
-    """A measurement job -- bottom or side -- with its own standoff, ROI and
-    calibration, pointed at whichever Cam currently performs it.
-    """
+    """A measurement JOB -- bottom or side -- with its own standoff, ROI and
+    calibration, pointed at whichever Cam currently performs it."""
 
-    def __init__(self, name, eff_dist, roi, prominence, calib_file, max_resid):
+    def __init__(self, name, eff_dist, roi, prominence, calib_file, max_resid,
+                 ref_file=None):
         self.name, self.calib_file = name, calib_file
+        self.ref_file = ref_file
+        self.ref = None          # G.Reference of the EMPTY fixture, or None
+        self.touch = 0           # specimen pixels pressed against opaque fixture
         self.cam = None
         self.cfg = G.Config()
         self.cfg.effDist = eff_dist
@@ -95,13 +94,46 @@ class Role:
         self.roi_spec = ([float(v) for v in roi.split(",")] if roi else None)
         self.roi_frac = (self.roi_spec is not None
                          and all(v <= 1.0 for v in self.roi_spec))
+        if ref_file and os.path.exists(ref_file):
+            try:
+                self.ref = G.Reference(np.load(ref_file))
+                print(f"# {name}: reference loaded from {ref_file} "
+                      f"({self.ref.masked_frac*100:.1f}% of frame opaque)")
+            except Exception as e:
+                print(f"# {name}: could not load {ref_file}: {e}")
 
     def grab(self):
-        return self.cam.grab()
+        """A frame with the empty fixture divided out, when a reference exists."""
+        img = self.cam.grab()
+        if self.ref is None:
+            self.touch = 0
+            return img
+        img, self.touch = self.ref.apply(img)
+        if self.touch > 20:
+            # Refuse rather than report.
+            raise RuntimeError(
+                f"{self.name}: coupon edge is behind the opaque part of the "
+                f"fixture ({self.touch} px in contact) - reseat it so the edge "
+                f"is visible")
+        return img
+
+    def capture_reference(self, n):
+        """Average n frames of the EMPTY fixture."""
+        frames = [self.cam.grab() for _ in range(n)]
+        ref = np.mean(frames, axis=0).astype(np.float32)
+        clipped = float((ref >= 254).mean() * 100)
+        self.ref = G.Reference(ref)
+        if self.ref_file:
+            np.save(self.ref_file, ref)
+        return self.ref, clipped
+
+    def clear_reference(self):
+        self.ref = None
+        if self.ref_file and os.path.exists(self.ref_file):
+            os.remove(self.ref_file)
 
     def find_roi(self, img):
-        """Resolve the ROI and remember it for the preview overlay.
-        """
+        """Resolve the ROI and remember it for the preview overlay."""
         self.last_w = img.shape[1]
         try:
             if self.roi_spec is None:
@@ -119,8 +151,8 @@ class Role:
         return r
 
     def configure_for(self, img, thickness):
-        """The Config chords.py needs: this role's ROI and calibration, with
-        focalPx rescaled to whatever resolution the frame actually is."""
+        """The Config chords.py needs: this role's ROI and calibration, with focalPx
+        rescaled to whatever resolution the frame actually is."""
         c = G.replace(self.cfg, roi=self.find_roi(img))
         c.focalPx = (G.scale_focal(self.focalPx, self.calib_w, img.shape[1])
                      if self.focalPx > 0 else 1.0)
@@ -128,9 +160,9 @@ class Role:
         return c
 
     def measure(self, img, thickness):
-        """`thickness` is the offset of this role's silhouette plane from its
-        reference: specT for the bottom view, 0 for the side view, whose
-        reference face IS its silhouette plane."""
+        """`thickness` is the offset of this role's silhouette plane from its reference:
+        specT for the bottom view, 0 for the side view, whose reference face IS its
+        silhouette plane."""
         c = G.replace(self.cfg, roi=self.find_roi(img))
         c.focalPx = (G.scale_focal(self.focalPx, self.calib_w, img.shape[1])
                      if self.focalPx > 0 else 1.0)
@@ -193,6 +225,11 @@ border-radius:6px}
   <select id="ax"><option value="length">length</option><option value="width">width</option></select>
   <button onclick="cal()">Calibrate</button>
   <button onclick="post('/log')">Log</button>
+  <div class="lab">Empty-fixture reference</div>
+  <div class="sub">Remove the coupon, then capture. Divides out the fixture and the
+   backlight's unevenness. Uses the view selected above.</div>
+  <button onclick="ref('capture')">Capture reference</button>
+  <button onclick="ref('clear')" style="background:#555">Clear reference</button>
   <button onclick="post('/profile')">Profile</button>
   <button onclick="if(confirm('Swap the cameras? Both calibrations will need redoing.'))post('/swap')"
    style="background:#7d5a2d">Swap cameras</button>
@@ -225,6 +262,10 @@ async function poll(){
    row('side tilt',s.tilt1===null?'--':s.tilt1.toFixed(2)+' deg')+
    row('pairing','bottom=sensor '+s.sensor0+', side=sensor '+s.sensor1,
        s.swapped?'warn':'')+
+   row('bottom reference',s.ref0?'on':'off',s.ref0?'ok':'warn')+
+   row('side reference',s.ref1?'on':'off',s.ref1?'ok':'warn')+
+   (s.touch0>0?row('bottom','coupon touching opaque fixture - edge hidden','bad'):'')+
+   (s.touch1>0?row('side','coupon touching opaque fixture - edge hidden','bad'):'')+
    row('plane',s.fixedPlane===null||s.fixedPlane===undefined?
        'floating (uses measured thickness)':'fixed at '+s.fixedPlane+' mm')+
    row('thickness 1s',s.tsd===null?'--':(s.tsd*1000).toFixed(1)+' um over '+s.n)+
@@ -235,10 +276,7 @@ async function poll(){
 async function post(u){say('working...');
  const t=await (await fetch(u,{method:'POST'})).text();
  if(u==='/profile'){el('pf').textContent=t;say('profiled')}else{say(t)}}
-// The side view's small axis is the THICKNESS, not a width. The value posted
-// stays "width" because that is the scan axis the engine uses; only the label
-// changes, so the operator is never asked to calibrate a dimension the specimen
-// does not have from that viewpoint.
+// Side view: label the small axis 'thickness' (value stays 'width').
 function axes(){var side=el('cam').value==='1';
  el('ax').options[1].text=side?'thickness':'width'}
 async function cal(){const v=parseFloat(el('km').value);
@@ -248,6 +286,12 @@ async function cal(){const v=parseFloat(el('km').value);
   headers:{'Content-Type':'application/json'},
   body:JSON.stringify({known_mm:v,camera:parseInt(el('cam').value),
    axis:el('ax').value})})).text())}
+async function ref(action){
+ if(action==='capture'&&!confirm('Is the fixture EMPTY? The reference must not contain a coupon.'))return;
+ say(action==='capture'?'capturing reference...':'clearing...');
+ say(await (await fetch('/reference',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({camera:parseInt(el('cam').value),action:action})})).text())}
 axes();poll();
 </script></body></html>"""
 
@@ -309,10 +353,7 @@ async function poll(){
 async function post(u){say('working...');
  const t=await (await fetch(u,{method:'POST'})).text();
  if(u==='/profile'){el('pf').textContent=t;say('profiled')}else{say(t)}}
-// The side view's small axis is the THICKNESS, not a width. The value posted
-// stays "width" because that is the scan axis the engine uses; only the label
-// changes, so the operator is never asked to calibrate a dimension the specimen
-// does not have from that viewpoint.
+// Side view: label the small axis 'thickness' (value stays 'width').
 function axes(){var side=el('cam').value==='1';
  el('ax').options[1].text=side?'thickness':'width'}
 async function cal(){const v=parseFloat(el('km').value);
@@ -363,6 +404,13 @@ def main():
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--calib0", default="calib_bottom.json")
     p.add_argument("--calib1", default="calib_side.json")
+    p.add_argument("--ref0", default="ref_bottom.npy",
+                   help="empty-fixture reference for the bottom view")
+    p.add_argument("--ref1", default="ref_side.npy",
+                   help="empty-fixture reference for the side view")
+    p.add_argument("--ref-frames", type=int, default=16,
+                   help="frames averaged into a reference; its noise lands on "
+                        "every later measurement, so more is better")
     p.add_argument("--state", default="dual_state.json",
                    help="remembers which sensor is bottom and which is side")
     p.add_argument("--swap", action="store_true",
@@ -371,13 +419,11 @@ def main():
 
     cams = [Cam(0, a.exposure0), Cam(1, a.exposure1)]
     bottom = Role("bottom", a.eff_dist0, a.roi0, a.prominence,
-                  a.calib0, a.max_residual)
+                  a.calib0, a.max_residual, a.ref0)
     side = Role("side", a.eff_dist1, a.roi1, a.prominence,
-                a.calib1, a.max_residual)
+                a.calib1, a.max_residual, a.ref1)
 
-    # Which sensor performs which role is persisted, because a restart that
-    # silently reverted the pairing would produce confident, wrong numbers: the
-    # side view measured with the bottom view's standoff and calibration.
+    # Persist the pairing so a restart can't silently revert it.
     def load_swap():
         try:
             return bool(json.load(open(a.state)).get("swapped", False))
@@ -400,6 +446,8 @@ def main():
     time.sleep(1.5)
 
     hist = collections.deque(maxlen=a.window)
+    # The most recent thickness cam1 produced, independent of whether cam0 is
+    # calibrated.
     latest = {"thickness": None}
     snap = {"json": json.dumps({"rate": 0.0}).encode(), "row": None}
 
@@ -436,8 +484,8 @@ def main():
         while True:
             try:
                 bgr = cam.preview()
-                # Whichever role is bound to this sensor right now -- so the
-                # overlay follows a camera swap without restarting anything.
+                # Whichever role is bound to this sensor right now -- so the overlay
+                # follows a camera swap without restarting anything.
                 role = bottom if bottom.cam is cam else side
                 if role.last_roi and role.last_w:
                     k = bgr.shape[1] / role.last_w
@@ -456,6 +504,7 @@ def main():
             d = {"rate": 0.0, "err0": None, "err1": None,
                  "cal0": bottom.focalPx > 0, "cal1": side.focalPx > 0,
                  "swapped": swapped["v"],
+                 "ref0": bottom.ref is not None, "ref1": side.ref is not None,
                  "sensor0": bottom.cam.index, "sensor1": side.cam.index,
                  "length_mm": None, "width_mm": None, "thickness_mm": None,
                  "delta_mm": None, "tilt0": None, "tilt1": None,
@@ -463,8 +512,8 @@ def main():
             row = None
 
             # --- SIDE FIRST: it produces the thickness the bottom camera needs.
-            # Its own silhouette plane is the coupon's reference face, so it is
-            # measured at offset 0 and needs nothing from the other camera.
+            # Its own silhouette plane is the coupon's reference face, so it is measured
+            # at offset 0 and needs nothing from the other camera.
             r1 = c1 = k1 = None
             try:
                 img1 = side.grab()
@@ -476,6 +525,9 @@ def main():
             except Exception as e:
                 d["err1"] = str(e)[:90]
 
+            # --- BOTTOM, using the measured thickness. Never a nominal one: at
+            # 775 mm a 1 mm thickness error is 1290 ppm, ten times the length budget,
+            # and the result looks perfectly reasonable.
             if a.plane_offset is not None:
                 specT = a.plane_offset
             else:
@@ -504,6 +556,8 @@ def main():
                 arr = np.array(hist)
                 d["tsd"] = float(arr.std(ddof=1))
             d["n"] = len(hist)
+            # Coupon pressed against opaque fixture: that edge is hidden.
+            d["touch0"], d["touch1"] = bottom.touch, side.touch
             d["rate"] = 1.0 / max(time.time() - t0, 1e-3)
             publish(d, row)
             if d["err0"] or d["err1"]:
@@ -567,9 +621,7 @@ def main():
                 cam = bottom if which == 0 else side
                 try:
                     img = cam.grab()
-                    # Calibrate at the same offset the camera measures at: specT
-                    # for the bottom camera comes from cam1; the side camera's
-                    # reference face IS its silhouette plane, so it is zero.
+                    # Calibrate at the same offset this view measures at.
                     if which == 0:
                         if a.plane_offset is not None:
                             # Fixed plane: no dependency, calibrate in any order.
@@ -597,7 +649,9 @@ def main():
                     return self._send(f"calibration failed: {e}".encode())
 
             if self.path == "/profile":
+                # Profile BOTH viewpoints.
                 out, rows = [], []
+                # Each view profiles INDEPENDENTLY.
                 if a.plane_offset is not None:
                     t, tnote = a.plane_offset, ""
                 elif latest["thickness"] is not None:
@@ -658,12 +712,44 @@ def main():
                     out.append(f"wrote {len(rows)} chords to {a.profile_csv}")
                 return self._send("\n".join(out).encode())
 
+            if self.path == "/reference":
+                n = int(self.headers.get("Content-Length", 0))
+                try:
+                    req = json.loads(self.rfile.read(n) or b"{}")
+                    which = int(req.get("camera", 0))
+                    action = req.get("action", "capture")
+                except Exception as e:
+                    return self._send(f"bad request: {e}".encode())
+                role = bottom if which == 0 else side
+                if action == "clear":
+                    role.clear_reference()
+                    hist.clear()
+                    return self._send(f"{role.name}: reference cleared".encode())
+                try:
+                    ref, clipped = role.capture_reference(a.ref_frames)
+                except Exception as e:
+                    return self._send(f"reference failed: {e}".encode())
+                hist.clear()
+                msg = (f"{role.name}: reference from {a.ref_frames} frames | "
+                       f"background {ref.bright:.0f} DN | "
+                       f"{ref.masked_frac*100:.1f}% of frame opaque")
+                if clipped > 0.01:
+                    msg += (f" | WARNING {clipped:.2f}% saturated - lower the "
+                            f"exposure and recapture; a clipped reference cannot "
+                            f"divide correctly")
+                msg += (" | recalibrate this view: edge positions have moved to "
+                        "their true place")
+                return self._send(msg.encode())
+
             if self.path == "/swap":
                 swapped["v"] = not swapped["v"]
+                # A reference is a picture of what one sensor saw from one place.
+                bottom.clear_reference()
+                side.clear_reference()
                 bind()
                 save_swap()
-                # The thickness history describes the old pairing; keeping it
-                # would blend two different geometries into one spread figure.
+                # The thickness history describes the old pairing; keeping it would
+                # blend two different geometries into one spread figure.
                 hist.clear()
                 latest["thickness"] = None
                 return self._send(
