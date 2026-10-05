@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 from picamera2 import Picamera2
 
-import chords as C
+import chord_measure as C
 import gauge as G
 
 
