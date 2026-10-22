@@ -434,12 +434,17 @@ def main():
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--calib0", default="calib_bottom.json")
     p.add_argument("--calib1", default="calib_side.json")
-    p.add_argument("--datum0", default="none", choices=("none",) + G.DATUMS,
+    # Both views see the same corner bar, so both default the same way. In the
+    # chair the coupon rests in a 90 degree corner: the bottom camera's width
+    # axis ends on the vertical plate, the side camera's thickness axis ends on
+    # the horizontal plate, and in both frames that bar lies BELOW the coupon.
+    # Pass none for a view whose small axis has two free edges.
+    p.add_argument("--datum0", default="below", choices=("none",) + G.DATUMS,
                    help="bottom view: side of the image where the coupon rests on "
-                        "the fixture, or none to measure both edges")
+                        "the fixture, or none to measure both edges (default below)")
     p.add_argument("--datum1", default="below", choices=("none",) + G.DATUMS,
                    help="side view: side of the image where the coupon rests on "
-                        "the plate (default below)")
+                        "the plate, or none to measure both edges (default below)")
     p.add_argument("--ref0", default="ref_bottom.npy",
                    help="empty-fixture reference for the bottom view")
     p.add_argument("--ref1", default="ref_side.npy",
