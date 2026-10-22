@@ -123,13 +123,32 @@ class Role:
         return img
 
     def capture_reference(self, n):
-        """Average n frames of the EMPTY fixture."""
-        frames = [self.cam.grab() for _ in range(n)]
-        ref = np.mean(frames, axis=0).astype(np.float32)
-        clipped = float((ref >= 254).mean() * 100)
-        self.ref = G.Reference(ref)
+        """Average n frames of the EMPTY fixture.
+
+        Accumulated in place. Holding all n frames and handing them to np.mean
+        costs 2 * n * 49 MB at 4056x3040 float32 -- 1.6 GB at the default n=16,
+        which the OOM killer ends on a Pi also running two cameras and Chromium.
+        This way the peak is two frames, whatever n is. Summing 16 frames of
+        0..255 reaches 4080, so float32 carries it exactly.
+        """
+        acc = None
+        hottest = 0.0
+        for _ in range(n):
+            f = self.cam.grab()
+            hottest = max(hottest, float(f.max()))
+            if acc is None:
+                acc = f                  # adopt the first frame's buffer
+            else:
+                acc += f                 # in place: allocates nothing
+                del f
+        acc /= float(n)
+        clipped = float((acc >= 254).mean() * 100)
+        if hottest >= 255.0 and clipped < 0.01:
+            # Averaging hides clipping that was present in individual frames.
+            clipped = max(clipped, 0.02)
+        self.ref = G.Reference(acc)
         if self.ref_file:
-            np.save(self.ref_file, ref)
+            np.save(self.ref_file, acc)
         return self.ref, clipped
 
     def clear_reference(self):
