@@ -67,8 +67,11 @@ class Role:
     calibration, pointed at whichever Cam currently performs it."""
 
     def __init__(self, name, eff_dist, roi, prominence, calib_file, max_resid,
-                 ref_file=None):
+                 ref_file=None, datum=None):
         self.name, self.calib_file = name, calib_file
+        self.datum = None if datum in (None, "none") else datum
+        self.datum_off = 0.0     # px between the reference datum and true contact
+        self.extras = None
         self.ref_file = ref_file
         self.ref = None          # G.Reference of the EMPTY fixture, or None
         self.touch = 0           # specimen pixels pressed against opaque fixture
@@ -84,7 +87,9 @@ class Role:
         if G.load_calib(calib_file, self.cfg):
             self.focalPx = self.cfg.focalPx
             try:
-                self.calib_w = int(json.load(open(calib_file)).get("imageWidth", 0))
+                rec = json.load(open(calib_file))
+                self.calib_w = int(rec.get("imageWidth", 0))
+                self.datum_off = float(rec.get("datumOffsetPx", 0.0))
             except Exception:
                 pass
             if eff_dist:
@@ -109,7 +114,7 @@ class Role:
             self.touch = 0
             return img
         img, self.touch = self.ref.apply(img)
-        if self.touch > 20:
+        if self.touch > 20 and not self.datum:   # contact is expected on a datum
             # Refuse rather than report.
             raise RuntimeError(
                 f"{self.name}: coupon edge is behind the opaque part of the "
@@ -151,7 +156,7 @@ class Role:
         return r
 
     def configure_for(self, img, thickness):
-        """The Config chords.py needs: this role's ROI and calibration, with focalPx
+        """The Config chord_measure.py needs: this role's ROI and calibration, with focalPx
         rescaled to whatever resolution the frame actually is."""
         c = G.replace(self.cfg, roi=self.find_roi(img))
         c.focalPx = (G.scale_focal(self.focalPx, self.calib_w, img.shape[1])
@@ -166,19 +171,42 @@ class Role:
         c = G.replace(self.cfg, roi=self.find_roi(img))
         c.focalPx = (G.scale_focal(self.focalPx, self.calib_w, img.shape[1])
                      if self.focalPx > 0 else 1.0)
-        r = G.measure(img, c, thickness)
+        if self.datum:
+            if self.ref is None:
+                raise RuntimeError(f"{self.name}: datum mode needs an empty-fixture "
+                                   f"reference - capture one")
+            r, self.extras = G.measure_datum(img, self.ref.ref, c, thickness,
+                                             self.datum, self.datum_off)
+        else:
+            r = G.measure(img, c, thickness)
         k = c.mmPerPx(thickness) if self.focalPx > 0 else 0.0
         return r, c, k
 
     def calibrate(self, px, known_mm, axis, thickness, width):
+        if not np.isfinite(px):
+            raise ValueError(f"{self.name}: {axis} not measurable in this frame")
         s_cal = self.cfg.effDistance - thickness
         if s_cal <= 0:
             raise ValueError("thickness exceeds eff-dist")
+        if self.datum and axis == "width":
+            # On a datum view the small axis sets the zero offset, not the scale.
+            if self.focalPx <= 0:
+                raise ValueError(f"{self.name}: calibrate the LENGTH first - the "
+                                 f"datum offset is set against the scale")
+            mmpx = s_cal / G.scale_focal(self.focalPx, self.calib_w, width)
+            self.datum_off = float(known_mm / mmpx - (px - self.datum_off))
+            G.save_calib(self.calib_file, self.focalPx,
+                         G.replace(self.cfg, focalPx=self.focalPx),
+                         image=f"live-{self.name}", imageWidth=int(self.calib_w),
+                         datumOffsetPx=self.datum_off, datumKnownMm=known_mm)
+            return (f"{self.name}: datum offset {self.datum_off:+.3f} px "
+                    f"({self.datum_off*mmpx*1000:+.1f} um)")
         f = float(px * s_cal / known_mm)
         self.focalPx, self.calib_w = f, int(width)
         G.save_calib(self.calib_file, f, G.replace(self.cfg, focalPx=f),
                      image=f"live-{self.name}", known_mm=known_mm, axis=axis,
-                     thickness=thickness, imageWidth=int(width))
+                     thickness=thickness, imageWidth=int(width),
+                     datumOffsetPx=self.datum_off)
         fov = 2 * np.degrees(np.arctan((width / 2) / f))
         return (f"{self.name}: focalPx {f:.2f} | {s_cal/f*1000:.4f} um/px | "
                 f"FOV {fov:.1f} deg"
@@ -263,6 +291,8 @@ async function poll(){
    row('pairing','bottom=sensor '+s.sensor0+', side=sensor '+s.sensor1,
        s.swapped?'warn':'')+
    row('bottom reference',s.ref0?'on':'off',s.ref0?'ok':'warn')+
+   row('bottom datum',s.datum0?s.datum0+', offset '+s.doff0.toFixed(2)+' px':'none (two edges)')+
+   row('side datum',s.datum1?s.datum1+', offset '+s.doff1.toFixed(2)+' px':'none (two edges)')+
    row('side reference',s.ref1?'on':'off',s.ref1?'ok':'warn')+
    (s.touch0>0?row('bottom','coupon touching opaque fixture - edge hidden','bad'):'')+
    (s.touch1>0?row('side','coupon touching opaque fixture - edge hidden','bad'):'')+
@@ -404,6 +434,12 @@ def main():
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--calib0", default="calib_bottom.json")
     p.add_argument("--calib1", default="calib_side.json")
+    p.add_argument("--datum0", default="none", choices=("none",) + G.DATUMS,
+                   help="bottom view: side of the image where the coupon rests on "
+                        "the fixture, or none to measure both edges")
+    p.add_argument("--datum1", default="below", choices=("none",) + G.DATUMS,
+                   help="side view: side of the image where the coupon rests on "
+                        "the plate (default below)")
     p.add_argument("--ref0", default="ref_bottom.npy",
                    help="empty-fixture reference for the bottom view")
     p.add_argument("--ref1", default="ref_side.npy",
@@ -419,9 +455,9 @@ def main():
 
     cams = [Cam(0, a.exposure0), Cam(1, a.exposure1)]
     bottom = Role("bottom", a.eff_dist0, a.roi0, a.prominence,
-                  a.calib0, a.max_residual, a.ref0)
+                  a.calib0, a.max_residual, a.ref0, a.datum0)
     side = Role("side", a.eff_dist1, a.roi1, a.prominence,
-                a.calib1, a.max_residual, a.ref1)
+                a.calib1, a.max_residual, a.ref1, a.datum1)
 
     # Persist the pairing so a restart can't silently revert it.
     def load_swap():
@@ -457,12 +493,13 @@ def main():
             "length_mm": f"{d['length_mm']:.4f}",
             "width_mm": f"{d['width_mm']:.4f}",
             "thickness_mm": f"{specT:.4f}",
-            "length_side_mm": f"{side_len:.4f}",
-            "delta_mm": f"{d['delta_mm']:+.4f}",
+            "length_side_mm": "" if side_len is None else f"{side_len:.4f}",
+            "delta_mm": "" if d["delta_mm"] is None else f"{d['delta_mm']:+.4f}",
             "length_px": f"{r0.length_px:.4f}",
             "width_px": f"{r0.width_px:.4f}",
             "thickness_px": f"{r1.width_px:.4f}",
-            "length_side_px": f"{r1.length_px:.4f}",
+            "length_side_px": (f"{r1.length_px:.4f}"
+                               if np.isfinite(r1.length_px) else ""),
             "tilt0_deg": f"{r0.tilt_deg:+.4f}",
             "tilt1_deg": f"{r1.tilt_deg:+.4f}",
             "rms0_px": f"{r0.edge_rms_px:.4f}",
@@ -505,6 +542,8 @@ def main():
                  "cal0": bottom.focalPx > 0, "cal1": side.focalPx > 0,
                  "swapped": swapped["v"],
                  "ref0": bottom.ref is not None, "ref1": side.ref is not None,
+                 "datum0": bottom.datum, "datum1": side.datum,
+                 "doff0": bottom.datum_off, "doff1": side.datum_off,
                  "sensor0": bottom.cam.index, "sensor1": side.cam.index,
                  "length_mm": None, "width_mm": None, "thickness_mm": None,
                  "delta_mm": None, "tilt0": None, "tilt1": None,
@@ -541,10 +580,13 @@ def main():
                 d["length_mm"] = float(r0.length_px * k0) if k0 else float(r0.length_px)
                 d["width_mm"] = float(r0.width_px * k0) if k0 else float(r0.width_px)
                 if k0 and k1:
-                    side_len = float(r1.length_px * k1)
-                    d["delta_mm"] = side_len - d["length_mm"]
-                    hist.append(specT)
-                    row = _row(r0, r1, c0, c1, specT, side_len, d)
+                    meas_t = float(r1.width_px * k1)
+                    side_len = (float(r1.length_px * k1)
+                                if np.isfinite(r1.length_px) else None)
+                    if side_len is not None:
+                        d["delta_mm"] = side_len - d["length_mm"]
+                    hist.append(meas_t)
+                    row = _row(r0, r1, c0, c1, meas_t, side_len, d)
             except Exception as e:
                 d["err0"] = str(e)[:90]
 
@@ -668,14 +710,29 @@ def main():
                         img = role.grab()
                         c = role.configure_for(img, off)
                         band = a.band if role.focalPx > 0 else 0.0
-                        lp, sp = C.measure_chords(img, c, off, a.chords, band,
-                                                  a.trim, a.order)
+                        if role.datum:
+                            # Small axis against the datum; length as a bonus.
+                            r, ex = role.measure(img, off)[0], role.extras
+                            mmpx = c.mmPerPx(off) if role.focalPx > 0 else 0.0
+                            sp = C.chords_from_values(ex["pos"], ex["small_px"], mmpx,
+                                                      a.chords, band, a.trim, small,
+                                                      r.tilt_deg)
+                            try:
+                                lp, _ = C.measure_chords(img, c, off, a.chords, band,
+                                                         a.trim, a.order)
+                            except Exception:
+                                lp = None
+                        else:
+                            lp, sp = C.measure_chords(img, c, off, a.chords, band,
+                                                      a.trim, a.order)
                     except Exception as e:
                         out.append(f"{label}: {str(e)[:80]}")
                         continue
                     cal = role.focalPx > 0
                     u = "mm" if cal else "px"
                     for pr, nm in ((lp, "length"), (sp, small)):
+                        if pr is None:
+                            continue
                         v = (pr.spans() if cal
                              else np.array([ch.span_px for ch in pr.chords]))
                         rng = float(v.max() - v.min())

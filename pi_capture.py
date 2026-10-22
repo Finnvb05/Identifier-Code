@@ -2,9 +2,6 @@
 """
 pi_capture.py -- metrology-grade frames from a Raspberry Pi HQ Camera.
 
-Captures RAW Bayer and extracts the green plane. Saves a 16-bit PNG that
-gauge.py reads directly.
-
     python3 pi_capture.py --info                  what the sensor offers
     python3 pi_capture.py -o shot.png             one frame
     python3 pi_capture.py -o shot.png --exposure 8000 --gain 1.0
@@ -33,13 +30,7 @@ except ImportError:
 # ----------------------------------------------------------------- bayer ---
 
 def green_plane(raw: np.ndarray, fmt: str) -> np.ndarray:
-    """Average the two green sites of every Bayer tile.
-
-    The format string names the tile order top-left, top-right, bottom-left,
-    bottom-right -- e.g. SRGGB12 means R G / G B. The two greens are always on
-    one diagonal or the other, so only two cases exist. Detect it rather than
-    assume, because the order flips when hflip or vflip is set.
-    """
+    """Average the two green sites of every Bayer tile."""
     order = fmt.lstrip("S")[:4]          # "RGGB", "BGGR", "GRBG", "GBRG"
     if order in ("RGGB", "BGGR"):        # greens at (0,1) and (1,0)
         g1, g2 = raw[0::2, 1::2], raw[1::2, 0::2]
@@ -57,8 +48,7 @@ def green_plane(raw: np.ndarray, fmt: str) -> np.ndarray:
 def open_camera(args):
     picam2 = Picamera2()
 
-    # Ask for UNPACKED raw. The default on the Pi is CSI2P, which crams two
-    # 12-bit pixels into three bytes and would need manual unpacking.
+    # Ask for UNPACKED raw.
     want = (args.width, args.height)
     fmt = None
     for m in picam2.sensor_modes:
@@ -73,6 +63,7 @@ def open_camera(args):
     unpacked = fmt.replace("_CSI2P", "")
 
     if getattr(args, "live", False):
+        # ONE configuration carrying both streams.
         cfg = picam2.create_video_configuration(
             main={"size": (800, 600), "format": "RGB888"},
             raw={"size": want, "format": unpacked},
@@ -88,6 +79,7 @@ def open_camera(args):
     exposure, gain = args.exposure, args.gain
 
     if args.auto_once:
+        # Let auto-exposure choose ONCE, read back what it picked, then pin it.
         picam2.set_controls({"AeEnable": True, "AwbEnable": False})
         picam2.start()
         time.sleep(2.5)                        # let the AE loop converge
@@ -130,8 +122,7 @@ def capture(picam2, fmt, size) -> np.ndarray:
 
 
 def infer_bits(g: np.ndarray) -> int:
-    """Bit depth.
-    """
+    """Bit depth from the DATA, not the format name."""
     m = float(g.max())
     for b in (8, 10, 12, 14, 16):
         if m <= 2 ** b - 1:
@@ -213,8 +204,7 @@ poll();
 
 
 def live_server(picam2, fmt, size, exposure, args):
-    """Serve an MJPEG preview with a Capture button.
-    """
+    """Serve an MJPEG preview with a Capture button."""
     import http.server, io, json, socket, threading
 
     lock = threading.Lock()          # only one thread may touch the camera
@@ -233,8 +223,8 @@ def live_server(picam2, fmt, size, exposure, args):
                 gw = None
             ok, buf = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, 80])
             state["jpeg"] = buf.tobytes() if ok else None
-            # Cast every value to a plain Python type: numpy scalars are not
-            # JSON serializable and would 500 the whole stats endpoint.
+            # Cast every value to a plain Python type: numpy scalars are not JSON
+            # serializable and would 500 the whole stats endpoint.
             state["stats"] = {
                 "p95": int(p95), "full": 255, "p95frac": float(p95) / 255.0,
                 "contrast": int(p95 - p5),
@@ -394,6 +384,8 @@ def main() -> None:
         return
 
     if a.sweep:
+        # Walk the exposure and report what matters: contrast, and whether the bright
+        # field has started to clip.
         print(f"\n  {'exposure':>10}{'95th pct':>11}{'contrast':>11}{'clipped':>10}  verdict")
         best = None
         for e in [int(exposure * k) for k in (0.25, 0.5, 1, 2, 4, 8)]:
@@ -425,8 +417,7 @@ def main() -> None:
             bits = infer_bits(g)
             print(f"# data is {bits}-bit (inferred from the values, not the format name)")
         path = a.out if a.frames == 1 else f"{a.out}_{i:03d}.png"
-        # 16-bit PNG: keeps all 12 bits. gauge.py normalises on load, so the
-        # extra precision survives into the float the edge finder works on.
+        # 16-bit PNG: keeps all 12 bits.
         cv2.imwrite(path, np.clip(g, 0, 65535).astype(np.uint16))
         print(f"# wrote {path}")
         if i == 0:

@@ -1,10 +1,17 @@
 # --- calibration: machine-specific, and actively dangerous to share ---
-calibration.json          # pi_measure.py, gauge.py (single camera)
+calibration.json          # gauge.py (single camera)
 calib_bottom.json         # pi_dual.py, bottom view
 calib_side.json           # pi_dual.py, side view
 calib_cam0.json           # earlier pi_dual.py naming
 calib_cam1.json
 dual_state.json           # which sensor is bottom vs side
+
+# --- empty-fixture references: ~47 MB each, machine-specific ---
+# np.save of a 4056x3040 float32 array. GitHub warns past 50 MB and
+# refuses past 100 MB, and a blob that size is painful to remove later.
+*.npy
+ref_bottom.npy
+ref_side.npy
 
 # --- measurement output ---
 *.csv

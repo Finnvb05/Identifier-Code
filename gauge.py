@@ -522,62 +522,150 @@ def _check_fit(a: Line, b: Line, span: float, what: str,
             f"the {span:.0f} px span) - the straight-line model does not describe "
             f"these edges. Too much rotation, or the edge genuinely is not "
             f"straight. Raise --max-residual to see the number anyway, and run "
-            f"chords.py on a captured frame to see the edge's actual shape.")
+            f"chord_measure.py on a captured frame to see the edge's actual shape.")
 
 
-def measure(img: np.ndarray, cfg: Config, thickness: Optional[float] = None) -> Result:
-    """One frame in, dimensions out."""
-    x0, y0, x1, y1 = cfg.roi
-    H, W = img.shape
-    if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
-        raise ValueError(f"roi {cfg.roi} does not fit inside a {W}x{H} frame")
-    roi = img[y0:y1, x0:x1]
-
-    # WIDTH: scan rows, giving a left and right edge per row.
-    y, xl, xr = scan(roi, cfg)
+def _span(arr: np.ndarray, cfg: Config, what: str) -> tuple[float, Line, Line]:
+    """Two-edge span across every line of arr, with its two fitted edge lines."""
+    y, lo, hi = scan(arr, cfg)
     if cfg.trimCorners:
-        a, b = valid_band(y, xl, xr)
+        a, b = valid_band(y, lo, hi)
         if b - a < 20:
-            raise RuntimeError(
-                f"only {b - a} rows cross both end faces - the specimen is too "
-                f"rotated for this axis. Square it to the frame.")
-        y, xl, xr = y[a:b + 1], xl[a:b + 1], xr[a:b + 1]
+            raise RuntimeError(f"only {b - a} {what} cross both end faces - the "
+                               f"specimen is too rotated. Square it to the frame.")
+        y, lo, hi = y[a:b + 1], lo[a:b + 1], hi[a:b + 1]
     if cfg.edgeTrim > 0 and y.size > 40:
         sp = y.max() - y.min()
         k = (y >= y.min() + cfg.edgeTrim * sp) & (y <= y.max() - cfg.edgeTrim * sp)
         if k.sum() > 20:
-            y, xl, xr = y[k], xl[k], xr[k]
-    left, right = fit(y, xl), fit(y, xr)
-    w_px = gap(left, right, float(np.median(y)))
-    _check_fit(left, right, w_px, "rows", cfg.maxResidualFrac)
+            y, lo, hi = y[k], lo[k], hi[k]
+    la, lb = fit(y, lo), fit(y, hi)
+    span = gap(la, lb, float(np.median(y)))
+    _check_fit(la, lb, span, what, cfg.maxResidualFrac)
+    return span, la, lb
 
-    # LENGTH: identical problem rotated 90 degrees, so transpose and reuse everything.
-    ty, tl, tr = scan(np.ascontiguousarray(roi.T), cfg)
-    if cfg.trimCorners:
-        a, b = valid_band(ty, tl, tr)
-        if b - a < 20:
-            raise RuntimeError(
-                f"only {b-a} columns cross both end faces - too rotated.")
-        ty, tl, tr = ty[a:b + 1], tl[a:b + 1], tr[a:b + 1]
-    if cfg.edgeTrim > 0 and ty.size > 40:
-        sp = ty.max() - ty.min()
-        k = (ty >= ty.min() + cfg.edgeTrim * sp) & (ty <= ty.max() - cfg.edgeTrim * sp)
-        if k.sum() > 20:
-            ty, tl, tr = ty[k], tl[k], tr[k]
-    top, bot = fit(ty, tl), fit(ty, tr)
-    l_px = gap(top, bot, float(np.median(ty)))
-    _check_fit(top, bot, l_px, "columns", cfg.maxResidualFrac)
 
-    # PIXELS -> MILLIMETRES.
+def _roi(img: np.ndarray, cfg: Config) -> np.ndarray:
+    x0, y0, x1, y1 = cfg.roi
+    H, W = img.shape
+    if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
+        raise ValueError(f"roi {cfg.roi} does not fit inside a {W}x{H} frame")
+    return img[y0:y1, x0:x1]
+
+
+def measure(img: np.ndarray, cfg: Config, thickness: Optional[float] = None) -> Result:
+    """One frame in, dimensions out."""
+    roi = _roi(img, cfg)
+    w_px, left, right = _span(roi, cfg, "rows")                            # horizontal
+    l_px, _, _ = _span(np.ascontiguousarray(roi.T), cfg, "columns")        # vertical
     mmpx = cfg.mmPerPx(thickness)
-
-    # The row scan gives the HORIZONTAL extent and the column scan the VERTICAL one.
     if cfg.autoOrient and w_px > l_px:
         w_px, l_px = l_px, w_px
-
     return Result(w_px * mmpx, l_px * mmpx, w_px, l_px, mmpx * 1000,
                   float(np.degrees(np.arctan(0.5 * (left.slope + right.slope)))),
                   0.5 * (left.rms + right.rms))
+
+
+DATUMS = ("below", "above", "left", "right")
+
+
+def _first_fall(prof: np.ndarray, from_end: bool, min_contrast: float,
+                hw: int) -> Optional[float]:
+    """Subpixel position of the first bright-to-dark edge, scanning from one end."""
+    p = prof[::-1] if from_end else prof
+    lo, hi = float(p.min()), float(p.max())
+    if hi - lo < min_contrast:
+        return None
+    dark = np.flatnonzero(p < 0.5 * (lo + hi))
+    if dark.size == 0:
+        return None
+    g = np.clip(-np.gradient(p), 0, None)        # falling edges only
+    x = float(dark[0])
+    for _ in range(2):
+        a, b = int(round(x)) - hw, int(round(x)) + hw + 1
+        if a < 0 or b > p.size:
+            return None
+        w = g[a:b]
+        if w.sum() <= 1e-9:
+            return None
+        x = float(np.dot(np.arange(a, b), w) / w.sum())
+    return p.size - 1 - x if from_end else x
+
+
+def _edge_points(arr: np.ndarray, cfg: Config, from_end: bool,
+                 hw: int) -> tuple[np.ndarray, np.ndarray]:
+    sm = cv2.GaussianBlur(arr, (0, 0), cfg.sigma) if cfg.sigma > 0 else arr
+    pos, val = [], []
+    for i in range(sm.shape[0]):
+        e = _first_fall(sm[i], from_end, cfg.minContrast, hw)
+        if e is not None:
+            pos.append(i)
+            val.append(e)
+    return np.array(pos, float), np.array(val, float)
+
+
+def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
+                  thickness: Optional[float], datum: str,
+                  offset_px: float = 0.0) -> tuple[Result, dict]:
+    """Measure a specimen resting on a fixture edge: one free edge against a datum.
+
+    `datum` is where the resting edge lies in the image (below/above/left/right).
+    The datum line is fitted from the empty-fixture reference; `offset_px` is the
+    constant gap between that line and the true contact line, set by calibration.
+    """
+    if datum not in DATUMS:
+        raise ValueError(f"datum must be one of {DATUMS}")
+    roi, rref = _roi(img, cfg), _roi(ref, cfg)
+    vertical = datum in ("below", "above")
+    from_end = datum in ("above", "left")
+    T = np.ascontiguousarray
+    free_arr = roi if vertical else T(roi.T)
+    small_arr, small_ref = (T(roi.T), T(rref.T)) if vertical else (roi, rref)
+
+    try:                                          # the free axis is only a cross-check
+        free_px, fa, fb = _span(free_arr, cfg, "free-axis lines")
+    except RuntimeError:
+        free_px, fa, fb = float("nan"), None, None
+
+    if cfg.halfwin > 0:
+        hw = cfg.halfwin
+    else:
+        gw = grad_width(cv2.GaussianBlur(small_arr, (0, 0), cfg.sigma), cfg)
+        hw = int(np.clip(round(cfg.halfwinK * gw), 3, 30)) if gw else 6
+
+    dp, dv = _edge_points(small_ref, cfg, from_end, hw)
+    if dp.size < 20:
+        raise RuntimeError("datum edge not found in the reference - the ROI must "
+                           "include the fixture edge the specimen rests on")
+    dline = fit(dp, dv)
+
+    cp, cv = _edge_points(small_arr, cfg, from_end, hw)
+    clear = (dline.slope * cp + dline.icept - cv) * (-1 if from_end else 1) > 5
+    cp, cv = cp[clear], cv[clear]                 # lines that actually cross the specimen
+    if cp.size > 40 and cfg.edgeTrim > 0:
+        sp = cp.max() - cp.min()
+        k = (cp >= cp.min() + cfg.edgeTrim * sp) & (cp <= cp.max() - cfg.edgeTrim * sp)
+        cp, cv = cp[k], cv[k]
+    if cp.size < 20:
+        raise RuntimeError("specimen edge not found clear of the datum")
+    cline = fit(cp, cv)
+    lim = max(3.0, cfg.maxResidualFrac * float(cp.max() - cp.min()))
+    if cline.rms > lim:
+        raise RuntimeError(f"free edge residual {cline.rms:.1f} px - not a straight edge")
+
+    m = 0.5 * (dline.slope + cline.slope)
+    k = 1.0 / np.sqrt(1 + m * m)
+    per_line = np.abs(dline.slope * cp + dline.icept - cv) * k + offset_px
+    at = float(np.median(cp))
+    small_px = abs((dline.slope - cline.slope) * at + dline.icept - cline.icept) * k \
+        + offset_px
+
+    mmpx = cfg.mmPerPx(thickness)
+    tilt = np.arctan(0.5 * (fa.slope + fb.slope)) if fa else -np.arctan(m)
+    rms = np.mean([fa.rms, fb.rms, cline.rms]) if fa else cline.rms
+    r = Result(small_px * mmpx, free_px * mmpx, small_px, free_px, mmpx * 1000,
+               float(np.degrees(tilt)), float(rms))
+    return r, {"pos": cp, "small_px": per_line, "datum": dline, "edge": cline}
 
 
 def run(cfg: Config, thickness: Optional[float]) -> None:

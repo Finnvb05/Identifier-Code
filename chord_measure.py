@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-chords.py - length and width sampled across the coupon.
+chord_measure.py -- length and width sampled ACROSS the coupon, not just the single fitted figure gauge.py reports.
 
-    python3 chords.py --image shot.png --auto-roi --thickness 5.5
-    python3 chords.py --image shot.png --auto-roi --thickness 5.5 -n 30 --csv prof.csv
-    python3 chords.py --image shot.png --auto-roi --thickness 5.5 --band 0
-
-Imports gauge.py for capture, ROI, edge finding and calibration. Nothing here
-changes gauge.py -- this is a second view of the same scan data.
+    python3 chord_measure.py --image shot.png --auto-roi --thickness 5.5
+    python3 chord_measure.py --image shot.png --auto-roi --thickness 5.5 -n 30 --csv prof.csv
+    python3 chord_measure.py --image shot.png --auto-roi --thickness 5.5 --band 0
 """
 
 import argparse
@@ -48,8 +45,7 @@ class Profile(NamedTuple):
 
 
 def _robust_mean(v):
-    """Mean after dropping points more than 3 MAD from the median.
-    """
+    """Mean after dropping points more than 3 MAD from the median."""
     v = np.asarray(v, float)
     if v.size < 4:
         return float(v.mean()), v.size
@@ -62,22 +58,7 @@ def _robust_mean(v):
 
 
 def decompose(pos, edge, order=3):
-    """Split an edge trace into straight, wavy and rough components.
-
-    These are three physically different things and lumping them into one RMS
-    hides which one you have:
-
-      straight  -- the best-fit line: the coupon's nominal edge
-      waviness  -- a smooth low-order departure from it: bow, saw wander, a
-                   press that closed unevenly. Real geometry, and it is what
-                   makes a single width number meaningless.
-      roughness -- what is left: fibre tear-out. Random, so the fit averages it
-                   away and it costs almost nothing.
-
-    A 4 mm width variation that is all waviness means the specimen is genuinely
-    that shape. The same number arising as roughness would mean a ragged edge
-    around a true rectangle. Different problems, different fixes.
-    """
+    """Split an edge trace into straight, wavy and rough components."""
     resid = edge - np.polyval(np.polyfit(pos, edge, 1), pos)
     wavy = np.polyval(np.polyfit(pos, resid, order), pos)
     rough = resid - wavy
@@ -86,15 +67,30 @@ def decompose(pos, edge, order=3):
             "rough_rms": float(np.sqrt(np.mean(rough ** 2)))}
 
 
+def chords_from_values(pos, vals, mmpx, n_chords, band_mm, trim_frac, label,
+                       tilt_deg=0.0):
+    """Chords from per-line spans already measured, e.g. against a datum."""
+    a = pos.min() + trim_frac * (pos.max() - pos.min())
+    b = pos.max() - trim_frac * (pos.max() - pos.min())
+    half = 0.5 * band_mm / mmpx if (mmpx > 0 and band_mm > 0) else 0.5
+    out = []
+    for c in np.linspace(a, b, n_chords):
+        sel = np.abs(pos - c) <= half
+        if not sel.any():
+            sel = np.zeros(pos.size, bool)
+            sel[int(np.argmin(np.abs(pos - c)))] = True
+        m, used = _robust_mean(vals[sel])
+        out.append(Chord(float(c), float((c - a) * mmpx), m, m * mmpx, used,
+                         float(vals[sel].std(ddof=1)) if sel.sum() > 1 else 0.0))
+    return Profile(out, float(tilt_deg), mmpx, label, None)
+
+
 def profile_axis(pos, lo, hi, cfg, mmpx, n_chords, band_mm, trim_frac, label,
                  order=3):
-    """Build one set of chords from a scan's (position, low edge, high edge).
-    """
+    """Build one set of chords from a scan's (position, low edge, high edge)."""
     centre = 0.5 * (lo + hi)
-    # A low-order polynomial through the centreline: smooth enough to be a stable
-    # local direction, flexible enough to follow real bow. Differentiated
-    # analytically rather than by finite differences, which would amplify the
-    # per-row noise into a useless slope.
+    # A low-order polynomial through the centreline: smooth enough to be a stable local
+    # direction, flexible enough to follow real bow.
     cpoly = np.polyfit(pos, centre, order)
     dpoly = np.polyder(cpoly)
     mloc = np.polyval(dpoly, pos)
@@ -129,7 +125,7 @@ def profile_axis(pos, lo, hi, cfg, mmpx, n_chords, band_mm, trim_frac, label,
 
 
 def measure_chords(img, cfg, thickness, n_chords, band_mm, trim_frac, order=3):
-    """Both directions. Returns (long_axis_profile, short_axis_profile)."""
+    """Both directions."""
     x0, y0, x1, y1 = cfg.roi
     H, W = img.shape
     if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
@@ -140,10 +136,8 @@ def measure_chords(img, cfg, thickness, n_chords, band_mm, trim_frac, order=3):
     ry, rl, rr = G.scan(roi, cfg)                                  # rows
     cy, cl, cr = G.scan(np.ascontiguousarray(roi.T), cfg)          # columns
 
-    # Drop scan lines that clip a corner instead of crossing both end faces --
-    # the same trap gauge.measure() guards against. It bites harder here: a bowed
-    # edge extends the specimen's bounding box beyond the flat part, so the extra
-    # lines all sit in the corner region and their chords are pure artefact.
+    # Drop scan lines that clip a corner instead of crossing both end faces -- the same
+    # trap gauge.measure() guards against.
     if cfg.trimCorners:
         for name, (pos, lo, hi) in (("rows", (ry, rl, rr)), ("cols", (cy, cl, cr))):
             a_, b_ = G.valid_band(pos, lo, hi)
@@ -160,15 +154,15 @@ def measure_chords(img, cfg, thickness, n_chords, band_mm, trim_frac, order=3):
     p_col = profile_axis(cy, cl, cr, cfg, mmpx, n_chords, band_mm, trim_frac,
                          "col", order)
 
-    # Name by magnitude, as gauge.py does, so the answer does not depend on which
-    # way round the coupon was laid down.
+    # Name by magnitude, as gauge.py does, so the answer does not depend on which way
+    # round the coupon was laid down.
     if p_row.spans().mean() >= p_col.spans().mean():
         return p_row._replace(label="length"), p_col._replace(label="width")
     return p_col._replace(label="length"), p_row._replace(label="width")
 
 
 def sparkline(p):
-    """Terminal profile. Over SSH this is faster to read than opening a plot."""
+    """Terminal profile."""
     s = p.spans()
     rng = float(s.max() - s.min())
     if rng < 1e-9:
@@ -201,12 +195,7 @@ def report(p, unit_mm):
             print(f"    {side}: waviness {sh['wave_ptp']*k:7.1f} {uu} p-p"
                   f"   roughness {sh['rough_rms']*k:6.1f} {uu} rms")
     print(sparkline(p))
-    # A profile that dips at both ends and peaks in the middle usually means the
-    # trim is too small and the end chords are clipping corners, not that the
-    # coupon is barrel-shaped.
-    # A chord that clips a corner is a real measurement of the wrong thing, and it
-    # only takes ONE to drag the mean. Compare each end against the robust middle
-    # rather than requiring both ends to be low.
+    # Both ends low usually means the end chords clip corners; raise --trim.
     s = p.spans() if unit_mm else np.array([c.span_px for c in p.chords])
     if len(s) >= 5:
         mid = float(np.median(s[len(s)//4: 3*len(s)//4]))
