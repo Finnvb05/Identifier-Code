@@ -7,12 +7,12 @@ pi_dual.py -- two HQ cameras: bottom for length and width, side for thickness.
 """
 
 import argparse
-import collections
 import csv
 import http.server
 import json
 import os
 import socket
+import sys
 import threading
 import time
 
@@ -27,6 +27,10 @@ try:                      # optional: push each logged row to the PaperSteel app
     from identifier_push import send_measurement
 except Exception:         # not installed, or no stark_ingest.conf yet
     send_measurement = None
+try:
+    import specimen_registry as SR
+except Exception:
+    SR = None
 
 
 # ------------------------------------------------------------------ camera --
@@ -50,6 +54,20 @@ class Cam:
             self.pc.set_controls({"AeEnable": False, "ExposureTime": exposure})
         self.pc.start()
 
+    def set_exposure(self, us):
+        """Fix the exposure, or hand it back to the sensor's own metering.
+
+        Blank or 0 re-enables AE. Auto exposure is convenient for aiming and
+        poison for measuring: the ISP walks the backlight level between frames,
+        which moves both edges of the silhouette.
+        """
+        with self.lock:
+            if us:
+                self.pc.set_controls({"AeEnable": False,
+                                      "ExposureTime": int(us)})
+            else:
+                self.pc.set_controls({"AeEnable": True})
+
     def grab(self):
         with self.lock:
             rgb = self.pc.capture_array("main")
@@ -65,6 +83,37 @@ class Cam:
             self.pc.stop(); self.pc.close()
         except Exception:
             pass
+
+
+class Window:
+    """A rolling buffer whose length can be changed while the server runs.
+
+    collections.deque fixes maxlen at construction, and the handlers close over
+    this object, so a deque could never be resized from the settings panel -- a
+    nested function cannot rebind a name in main(). This keeps the same tiny
+    interface (append / clear / len / np.array) and adds resize().
+    """
+
+    def __init__(self, n):
+        self.v = []
+        self.resize(n)
+
+    def resize(self, n):
+        self.n = max(1, int(n))
+        del self.v[:-self.n]
+
+    def append(self, x):
+        self.v.append(x)
+        del self.v[:-self.n]
+
+    def clear(self):
+        self.v.clear()
+
+    def __len__(self):
+        return len(self.v)
+
+    def __array__(self, dtype=None):
+        return np.asarray(self.v, dtype)
 
 
 class Role:
@@ -285,7 +334,14 @@ button{font:600 14px system-ui;padding:10px 18px;margin:10px 6px 0 0;border:0;
 border-radius:6px;background:#2d7d5a;color:#fff}
 input,select{padding:9px;background:#1e1e1e;color:#eee;border:1px solid #3a3a3a;
 border-radius:6px}
-#msg{color:#9c9;font-size:12px;min-height:34px;margin-top:8px}
+#msg{color:#9c9;font-size:12px;min-height:34px;margin-top:8px;white-space:pre-wrap;word-break:break-word}
+details{margin-top:14px;border:1px solid #333;border-radius:6px;padding:4px 10px 10px}
+summary{cursor:pointer;font-size:12px;text-transform:uppercase;letter-spacing:.07em;
+color:#7d7d7d;padding:8px 0}
+.cfgrow{display:flex;align-items:flex-start;gap:10px;margin:7px 0;padding-bottom:7px;
+border-bottom:1px solid #2a2a2a}
+.cfgrow label{flex:1;font-size:13px;color:#ccc}
+.cfgrow input,.cfgrow select{width:170px;flex:none}
 </style></head><body>
 <div class="wrap">
  <div class="cam"><img src="/stream0"><div class="cap" id="cap0">bottom - length &amp; width</div></div>
@@ -304,8 +360,12 @@ border-radius:6px}
   <select id="ax"><option value="length">length</option><option value="width">width</option></select>
   <button onclick="cal()">Calibrate</button>
   <div class="lab">Specimen</div>
-  <input id="sid" placeholder="PS-V4-038" style="width:150px"
+  <select id="smode" onchange="smode()">
+   <option value="existing">existing</option><option value="new">new</option></select>
+  <input id="sid" list="slist" placeholder="PS-V4-038" style="width:150px"
    oninput="this.value=this.value.toUpperCase()">
+  <datalist id="slist"></datalist>
+  <button onclick="getspecimens()" style="background:#555">Refresh list</button>
   <button onclick="logrow()">Log</button>
   <div class="lab">Region of interest</div>
   <div class="sub">x0,y0,x1,y1 -- pixels, or fractions of the frame when all are
@@ -321,13 +381,22 @@ border-radius:6px}
   <button onclick="post('/profile')">Profile</button>
   <button onclick="if(confirm('Swap the cameras? Both calibrations will need redoing.'))post('/swap')"
    style="background:#7d5a2d">Swap cameras</button>
+  <details id="cfg" ontoggle="if(this.open)loadcfg()">
+   <summary>Settings</summary>
+   <div class="sub">Everything the command line can set. A flag you passed at
+    launch stays in force until you change it here; what you change here is
+    saved to the state file and survives a restart.</div>
+   <div id="cfgbody"><div class="sub">loading...</div></div>
+   <button onclick="savecfg()">Apply &amp; save</button>
+   <button onclick="loadcfg()" style="background:#555">Revert</button>
+  </details>
   <div id="msg"></div>
   <pre id="pf" style="background:#111;padding:9px;border-radius:5px;font-size:11px;
    white-space:pre;overflow-x:auto;color:#bbb;margin-top:8px"></pre>
  </div>
 </div><script>
 function el(i){return document.getElementById(i)}
-function say(t){var v=String(t||'');el('msg').textContent=v.length>200?v.slice(0,200):v}
+function say(t){var v=String(t||'');el('msg').textContent=v.length>600?v.slice(0,600):v}
 function row(k,v,c){return '<tr><td>'+k+'</td><td class="'+(c||'')+'">'+v+'</td></tr>'}
 function fmt(id,v,u,cal){el(id).innerHTML=(v===null||v===undefined)?'--':
  v.toFixed(cal?3:1)+'<small>'+u+'</small>'}
@@ -368,11 +437,47 @@ async function poll(){
 async function post(u){say('working...');
  const t=await (await fetch(u,{method:'POST'})).text();
  if(u==='/profile'){el('pf').textContent=t;say('profiled')}else{say(t)}}
-async function logrow(){const s=el('sid')?el('sid').value.trim():'';
+function cfgesc(v){return String(v===null||v===undefined?'':v)
+ .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
+var CFGHEAD={live:'takes effect immediately',camera:'sent to the sensor now',
+ restart:'needs a restart'};
+async function loadcfg(){
+ try{const r=await (await fetch('/settings')).json();var g={},o=[];
+  r.spec.forEach(function(t){(g[t.scope]=g[t.scope]||[]).push(t)});
+  ['live','camera','restart'].forEach(function(sc){
+   if(!g[sc])return;
+   o.push('<div class="lab">'+CFGHEAD[sc]+'</div>');
+   g[sc].forEach(function(t){
+    var v=r.values[t.key],p=r.pending[t.key],shown=(p===undefined?v:p);
+    var f=t.choices?('<select id="cf_'+t.key+'">'+t.choices.map(function(c){
+      return '<option'+(c===String(v)?' selected':'')+'>'+c+'</option>'
+     }).join('')+'</select>')
+     :('<input id="cf_'+t.key+'" value="'+cfgesc(shown)+'">');
+    o.push('<div class="cfgrow"><label for="cf_'+t.key+'">'+t.label+
+     (p===undefined?'':' <b style="color:#e8a33d">pending restart</b>')+
+     (t.hint?'<br><span class="sub">'+t.hint+'</span>':'')+'</label>'+f+'</div>')})});
+  el('cfgbody').innerHTML=o.join('')}
+ catch(e){el('cfgbody').innerHTML='<div class="sub">could not load settings</div>'}}
+async function savecfg(){var o={};
+ document.querySelectorAll('[id^=cf_]').forEach(function(e){o[e.id.slice(3)]=e.value});
+ say('saving...');
+ say(await (await fetch('/settings',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})).text());
+ loadcfg()}
+function smode(){var n=el('smode').value==='new';
+ el('sid').placeholder=n?'PS-V4   (series)':'PS-V4-038';
+ el('sid').setAttribute('list',n?'':'slist')}
+async function getspecimens(){say('fetching specimen list...');
+ try{const r=await (await fetch('/specimens')).json();
+  el('slist').innerHTML=r.codes.map(c=>'<option value="'+c+'">').join('');
+  say(r.error?('list failed: '+r.error):(r.codes.length+' specimens loaded'))}
+ catch(e){say('could not reach the app')}}
+async function logrow(){
  say('logging...');
  say(await (await fetch('/log',{method:'POST',
   headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({specimen_id:s})})).text())}
+  body:JSON.stringify({mode:el('smode').value,
+   specimen_id:el('sid')?el('sid').value.trim():''})})).text())}
 // Side view: label the small axis 'thickness' (value stays 'width').
 function axes(){var side=el('cam').value==='1';
  el('ax').options[1].text=side?'thickness':'width'}
@@ -403,7 +508,8 @@ TOUCH = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>gauge</title
 touch-action:manipulation}
 html,body{margin:0;height:100%;background:#101010;color:#eee;font:16px system-ui;
 overflow:hidden}
-.pane{height:100%;display:flex;flex-direction:column;padding:16px;gap:6px}
+.pane{height:100%;display:flex;flex-direction:column;padding:16px;gap:6px;
+overflow-y:auto}
 .lab{font-size:17px;letter-spacing:.13em;color:#7d7d7d;text-transform:uppercase}
 .val{font:700 66px ui-monospace,monospace;color:#7fd8a8;line-height:1.05;margin:0}
 .val small{font:400 21px system-ui;color:#6a6a6a;margin-left:7px}
@@ -415,7 +521,15 @@ border:1px solid #3a3a3a;border-radius:11px;padding:0 12px;text-align:center}
 button{width:100%;min-height:76px;font:600 26px system-ui;border:0;border-radius:11px;
 background:#2d7d5a;color:#fff;margin-top:9px}
 button:active{background:#256b4c}
-#msg{min-height:38px;font-size:15px;color:#8fbf9f;overflow:hidden}
+#msg{min-height:38px;font-size:15px;color:#8fbf9f;overflow:auto;max-height:22vh;white-space:pre-wrap;word-break:break-word}
+.sub{font-size:13px;color:#777}
+details{margin-top:9px;border:1px solid #333;border-radius:11px;padding:4px 12px 10px;
+max-height:46vh;overflow:auto}
+summary{cursor:pointer;font-size:17px;letter-spacing:.13em;color:#7d7d7d;
+text-transform:uppercase;padding:10px 0}
+.cfgrow{display:flex;align-items:center;gap:10px;margin:8px 0}
+.cfgrow label{flex:1;font-size:15px;color:#ccc}
+.cfgrow input,.cfgrow select{width:150px;flex:none;min-height:50px;font-size:20px}
 .stale{color:#8a5a52 !important}
 </style></head><body><div class="pane">
 <div><div class="lab">Length</div><div class="val" id="L">--</div></div>
@@ -431,15 +545,28 @@ button:active{background:#256b4c}
  <select id="ax"><option value="length">length</option><option value="width">width</option></select>
 </div>
 <button onclick="cal()">Calibrate</button>
-<input id="sid" placeholder="PS-V4-038" style="width:100%;margin-top:9px"
- oninput="this.value=this.value.toUpperCase()">
+<div class="row" style="margin-top:9px">
+ <select id="smode" onchange="smode()" style="flex:0 0 38%">
+  <option value="existing">existing</option><option value="new">new</option></select>
+ <input id="sid" list="slist" placeholder="PS-V4-038"
+  oninput="this.value=this.value.toUpperCase()">
+ <datalist id="slist"></datalist>
+</div>
 <button onclick="logrow()">Log reading</button>
+<button onclick="getspecimens()" style="background:#555">Refresh specimen list</button>
 <button onclick="post('/profile')">Profile</button>
 <button onclick="if(confirm('Swap cameras? Recalibrate after.'))post('/swap')"
  style="background:#7d5a2d">Swap cameras</button>
+<details id="cfg" ontoggle="if(this.open)loadcfg()">
+ <summary>Settings</summary>
+ <div class="sub">Saved to the state file; survives a restart.</div>
+ <div id="cfgbody"><div class="sub">loading...</div></div>
+ <button onclick="savecfg()">Apply &amp; save</button>
+ <button onclick="loadcfg()" style="background:#555">Revert</button>
+</details>
 </div><script>
 function el(i){return document.getElementById(i)}
-function say(t){var v=String(t||'');el('msg').textContent=v.length>150?v.slice(0,150):v}
+function say(t){var v=String(t||'');el('msg').textContent=v.length>400?v.slice(0,400):v}
 function fmt(id,v,u,cal){var e=el(id);
  if(v===null||v===undefined){e.innerHTML='--';e.classList.add('stale')}
  else{e.innerHTML=v.toFixed(cal?2:1)+'<small>'+u+'</small>';e.classList.remove('stale')}}
@@ -457,11 +584,47 @@ async function poll(){
 async function post(u){say('working...');
  const t=await (await fetch(u,{method:'POST'})).text();
  if(u==='/profile'){el('pf').textContent=t;say('profiled')}else{say(t)}}
-async function logrow(){const s=el('sid')?el('sid').value.trim():'';
+function cfgesc(v){return String(v===null||v===undefined?'':v)
+ .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
+var CFGHEAD={live:'takes effect immediately',camera:'sent to the sensor now',
+ restart:'needs a restart'};
+async function loadcfg(){
+ try{const r=await (await fetch('/settings')).json();var g={},o=[];
+  r.spec.forEach(function(t){(g[t.scope]=g[t.scope]||[]).push(t)});
+  ['live','camera','restart'].forEach(function(sc){
+   if(!g[sc])return;
+   o.push('<div class="lab">'+CFGHEAD[sc]+'</div>');
+   g[sc].forEach(function(t){
+    var v=r.values[t.key],p=r.pending[t.key],shown=(p===undefined?v:p);
+    var f=t.choices?('<select id="cf_'+t.key+'">'+t.choices.map(function(c){
+      return '<option'+(c===String(v)?' selected':'')+'>'+c+'</option>'
+     }).join('')+'</select>')
+     :('<input id="cf_'+t.key+'" value="'+cfgesc(shown)+'">');
+    o.push('<div class="cfgrow"><label for="cf_'+t.key+'">'+t.label+
+     (p===undefined?'':' <b style="color:#e8a33d">pending restart</b>')+
+     (t.hint?'<br><span class="sub">'+t.hint+'</span>':'')+'</label>'+f+'</div>')})});
+  el('cfgbody').innerHTML=o.join('')}
+ catch(e){el('cfgbody').innerHTML='<div class="sub">could not load settings</div>'}}
+async function savecfg(){var o={};
+ document.querySelectorAll('[id^=cf_]').forEach(function(e){o[e.id.slice(3)]=e.value});
+ say('saving...');
+ say(await (await fetch('/settings',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})).text());
+ loadcfg()}
+function smode(){var n=el('smode').value==='new';
+ el('sid').placeholder=n?'PS-V4   (series)':'PS-V4-038';
+ el('sid').setAttribute('list',n?'':'slist')}
+async function getspecimens(){say('fetching specimen list...');
+ try{const r=await (await fetch('/specimens')).json();
+  el('slist').innerHTML=r.codes.map(c=>'<option value="'+c+'">').join('');
+  say(r.error?('list failed: '+r.error):(r.codes.length+' specimens loaded'))}
+ catch(e){say('could not reach the app')}}
+async function logrow(){
  say('logging...');
  say(await (await fetch('/log',{method:'POST',
   headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({specimen_id:s})})).text())}
+  body:JSON.stringify({mode:el('smode').value,
+   specimen_id:el('sid')?el('sid').value.trim():''})})).text())}
 // Side view: label the small axis 'thickness' (value stays 'width').
 function axes(){var side=el('cam').value==='1';
  el('ax').options[1].text=side?'thickness':'width'}
@@ -480,6 +643,45 @@ LOG_COLS = ["when", "specimen_id", "length_mm", "width_mm", "thickness_mm", "len
             "delta_mm", "length_px", "width_px", "thickness_px", "length_side_px",
             "tilt0_deg", "tilt1_deg", "rms0_px", "rms1_px",
             "focalPx0", "effDist0", "focalPx1", "effDist1", "roi0", "roi1", "note"]
+
+
+def parse_fields(spec):
+    """'species=beech, batch=B12, density=720' -> a dict for the insert.
+
+    Values go through json.loads first, so 720 arrives as a number and true as
+    a boolean; anything that is not valid JSON stays the text you typed. That
+    matters because a numeric column refuses the string "720" on some setups
+    and accepts the number on all of them.
+    """
+    out = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"{part!r} is not key=value")
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k:
+            raise ValueError(f"{part!r} has no column name")
+        try:
+            out[k] = json.loads(v)
+        except Exception:
+            out[k] = v
+    return out
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def here(name):
+    """A default path NEXT TO THIS SCRIPT, not next to wherever you ran it.
+
+    Launched from the wrong directory, a bare 'measurements.csv' quietly starts
+    a second log somewhere else and the first one stops growing. An explicit
+    --flag is still taken exactly as typed.
+    """
+    return os.path.join(HERE, name)
 
 
 def main():
@@ -509,10 +711,19 @@ def main():
                    help="centreline polynomial order; 1 assumes straight edges")
     p.add_argument("--profile-csv", metavar="FILE",
                    help="Profile also writes every chord to this CSV")
-    p.add_argument("--log", metavar="CSV"); p.add_argument("--note", default="")
+    p.add_argument("--log", metavar="CSV", default=here("measurements.csv"),
+                   help="every logged reading is appended here. Defaults to "
+                        "measurements.csv beside this script; pass --log '' to "
+                        "turn the CSV off")
+    p.add_argument("--note", default="")
+    p.add_argument("--new-fields", default="",
+                   help="extra columns written into `specimens` when the Pi "
+                        "mints a new ID, as key=value pairs: "
+                        "--new-fields 'species=beech, batch=B12'. Needed for "
+                        "every NOT NULL column the table has besides the code.")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--calib0", default="calib_bottom.json")
-    p.add_argument("--calib1", default="calib_side.json")
+    p.add_argument("--calib0", default=here("calib_bottom.json"))
+    p.add_argument("--calib1", default=here("calib_side.json"))
     # Both views see the same corner bar, so both default the same way. In the
     # chair the coupon rests in a 90 degree corner: the bottom camera's width
     # axis ends on the vertical plate, the side camera's thickness axis ends on
@@ -524,26 +735,21 @@ def main():
     p.add_argument("--datum1", default="below", choices=("none",) + G.DATUMS,
                    help="side view: side of the image where the coupon rests on "
                         "the plate, or none to measure both edges (default below)")
-    p.add_argument("--ref0", default="ref_bottom.npy",
+    p.add_argument("--ref0", default=here("ref_bottom.npy"),
                    help="empty-fixture reference for the bottom view")
-    p.add_argument("--ref1", default="ref_side.npy",
+    p.add_argument("--ref1", default=here("ref_side.npy"),
                    help="empty-fixture reference for the side view")
     p.add_argument("--ref-frames", type=int, default=16,
                    help="frames averaged into a reference; its noise lands on "
                         "every later measurement, so more is better")
-    p.add_argument("--state", default="dual_state.json",
+    p.add_argument("--state", default=here("dual_state.json"),
                    help="remembers which sensor is bottom and which is side")
     p.add_argument("--swap", action="store_true",
                    help="start with the two cameras exchanged")
     a = p.parse_args()
 
-    cams = [Cam(0, a.exposure0), Cam(1, a.exposure1)]
-    bottom = Role("bottom", a.eff_dist0, a.roi0, a.prominence,
-                  a.calib0, a.max_residual, a.ref0, a.datum0)
-    side = Role("side", a.eff_dist1, a.roi1, a.prominence,
-                a.calib1, a.max_residual, a.ref1, a.datum1)
-
-    # Persist the pairing and the ROIs so a restart can't silently revert them.
+    # Persist the pairing, the ROIs and the settings so a restart can't
+    # silently revert them.
     def load_state():
         try:
             return json.load(open(a.state))
@@ -551,6 +757,33 @@ def main():
             return {}
 
     state = load_state()
+
+    # A flag you actually typed always beats a stored value. Without this, a
+    # number dialled into the panel three sessions ago would quietly override a
+    # deliberate command line, which is the worst kind of bug to chase: the
+    # launch line says one thing and the machine does another.
+    typed = {arg.split("=", 1)[0].lstrip("-").replace("-", "_")
+             for arg in sys.argv[1:] if arg.startswith("--")}
+    tuned = dict(state.get("settings") or {})
+    dropped = []
+    for k in list(tuned):
+        if k not in vars(a):
+            continue
+        if k in typed:
+            # Typing the flag is the more deliberate act, so it wins -- and the
+            # stored value is FORGOTTEN rather than left to reappear at the next
+            # launch. A state file that quietly disagrees with the command line
+            # is the worst kind of thing to debug.
+            dropped.append(f"{k} (was {tuned.pop(k)}, now {getattr(a, k)})")
+        else:
+            setattr(a, k, tuned[k])
+
+    cams = [Cam(0, a.exposure0), Cam(1, a.exposure1)]
+    bottom = Role("bottom", a.eff_dist0, a.roi0, a.prominence,
+                  a.calib0, a.max_residual, a.ref0, a.datum0)
+    side = Role("side", a.eff_dist1, a.roi1, a.prominence,
+                a.calib1, a.max_residual, a.ref1, a.datum1)
+
     swapped = {"v": a.swap or bool(state.get("swapped", False))}
 
     def bind():
@@ -561,7 +794,8 @@ def main():
         try:
             json.dump({"swapped": swapped["v"],
                        "roi0": bottom.roi_spec,
-                       "roi1": side.roi_spec}, open(a.state, "w"))
+                       "roi1": side.roi_spec,
+                       "settings": tuned}, open(a.state, "w"), indent=1)
         except Exception as e:
             print(f"# could not save {a.state}: {e}")
 
@@ -576,10 +810,149 @@ def main():
             except Exception as e:
                 print(f"# {role.name}: ignoring bad saved ROI: {e}")
 
+    if dropped:
+        print("# command line overrides stored settings, forgetting: "
+              + ", ".join(dropped))
+        save_state()
+
     bind()
     time.sleep(1.5)
 
-    hist = collections.deque(maxlen=a.window)
+    hist = Window(a.window)
+
+    # ------------------------------------------------------------ settings --
+    # Every flag the browser can reach. "scope" says when a change bites:
+    #   live     -- the next measurement already uses it
+    #   camera   -- pushed to the sensor immediately
+    #   restart  -- stored now, picked up when the process next starts
+    # Nothing here is a file the station writes by itself; the paths are listed
+    # so you can see what is in use, and changing one is a deliberate act.
+    def T(key, label, kind, scope, hint, choices=None, rng=None, blank=None):
+        return {"key": key, "label": label, "kind": kind, "scope": scope,
+                "hint": hint, "choices": choices, "rng": rng, "blank": blank}
+
+    DATUMS = ("none",) + tuple(G.DATUMS)
+    TUNABLES = [
+        T("eff_dist0", "bottom lens distance", "float", "live",
+          "platform to lens, mm", rng=(1, 100000)),
+        T("eff_dist1", "side lens distance", "float", "live",
+          "coupon reference face to lens, mm", rng=(1, 100000)),
+        T("plane_offset", "fixed silhouette plane", "float", "live",
+          "mm above the bottom view's reference. 0 for the chair geometry. "
+          "Blank = float, taking the thickness the side view measures",
+          blank=True),
+        T("datum0", "bottom datum", "choice", "live",
+          "side of the frame the coupon rests against, or none for two edges",
+          choices=DATUMS),
+        T("datum1", "side datum", "choice", "live",
+          "same, for the side view", choices=DATUMS),
+        T("exposure0", "sensor 0 exposure", "int", "camera",
+          "microseconds. Blank = auto, which drifts between frames and moves "
+          "both edges -- fix it before measuring", blank=True, rng=(10, 2000000)),
+        T("exposure1", "sensor 1 exposure", "int", "camera",
+          "microseconds. Blank = auto", blank=True, rng=(10, 2000000)),
+        T("prominence", "ROI prominence", "float", "live",
+          "how far an edge must stand out of the background for auto-ROI to "
+          "accept it", rng=(0.1, 1000)),
+        T("max_residual", "max edge residual", "float", "live",
+          "fraction of the span an edge fit may deviate before the view is "
+          "called bad", rng=(0.0001, 1)),
+        T("window", "averaging window", "int", "live",
+          "readings behind the 1s thickness stability figure", rng=(1, 5000)),
+        T("chords", "profile chords", "int", "live",
+          "chords per axis when you press Profile", rng=(2, 2000)),
+        T("band", "chord band", "float", "live",
+          "mm of specimen averaged into each chord; 0 = a single row",
+          rng=(0, 1000)),
+        T("trim", "chord end trim", "float", "live",
+          "fraction dropped at each end, where chords clip the corners",
+          rng=(0, 0.45)),
+        T("order", "centreline order", "int", "live",
+          "polynomial order; 1 assumes perfectly straight edges", rng=(1, 8)),
+        T("ref_frames", "reference frames", "int", "live",
+          "frames averaged into an empty-fixture reference. Its noise lands on "
+          "every later measurement, so more is better", rng=(1, 200)),
+        T("note", "note on every row", "text", "live",
+          "free text written into the CSV and pushed with each measurement"),
+        T("new_fields", "new specimen fields", "text", "live",
+          "key=value pairs written into the specimens table when you mint a "
+          "new ID, e.g. species=beech, batch=B12. Every NOT NULL column that "
+          "table has besides the code must appear here", blank=True),
+        T("log", "measurement CSV", "text", "live",
+          "appended to on every Log. Blank turns the CSV off", blank=True),
+        T("profile_csv", "profile CSV", "text", "live",
+          "Profile also writes every chord here. Blank = off", blank=True),
+        T("calib0", "bottom calibration file", "text", "restart", "", blank=True),
+        T("calib1", "side calibration file", "text", "restart", "", blank=True),
+        T("ref0", "bottom reference file", "text", "restart", "", blank=True),
+        T("ref1", "side reference file", "text", "restart", "", blank=True),
+        T("state", "state file", "text", "restart",
+          "pairing, ROIs and these settings", blank=True),
+        T("port", "web port", "int", "restart", "", rng=(1, 65535)),
+    ]
+    BY_KEY = {t["key"]: t for t in TUNABLES}
+
+    def coerce(t, raw):
+        """Text from a form field -> the value the flag expects, or ValueError."""
+        txt = str(raw).strip()
+        if t["kind"] == "choice":
+            if txt not in t["choices"]:
+                raise ValueError(f"must be one of {', '.join(t['choices'])}")
+            return txt
+        if t["kind"] == "text":
+            if txt == "" and not t["blank"]:
+                raise ValueError("cannot be empty")
+            return txt
+        if txt == "":
+            if not t["blank"]:
+                raise ValueError("needs a number")
+            return None
+        v = float(txt)
+        if t["kind"] == "int":
+            v = int(round(v))
+        lo, hi = t["rng"] or (None, None)
+        if lo is not None and not (lo <= v <= hi):
+            raise ValueError(f"must be between {lo} and {hi}")
+        return v
+
+    def apply_live(key, val):
+        """Push a setting into the objects already running.
+
+        Anything read straight off `a` at use time needs nothing more than the
+        setattr; the rest is copied into the object that cached it at startup.
+        """
+        setattr(a, key, val)
+        if key == "eff_dist0":
+            bottom.cfg.effDist = val
+        elif key == "eff_dist1":
+            side.cfg.effDist = val
+        elif key == "max_residual":
+            bottom.cfg.maxResidualFrac = side.cfg.maxResidualFrac = val
+        elif key == "prominence":
+            bottom.prominence = side.prominence = val
+        elif key == "datum0":
+            bottom.datum = None if val == "none" else val
+        elif key == "datum1":
+            side.datum = None if val == "none" else val
+        elif key == "window":
+            hist.resize(val)
+        elif key == "exposure0":
+            cams[0].set_exposure(val)
+        elif key == "exposure1":
+            cams[1].set_exposure(val)
+
+    def settings_doc():
+        # "values" is what the station is RUNNING on. "pending" is what a
+        # restart-scope field has been set to but cannot use yet -- shown
+        # separately so a change never looks like it was swallowed.
+        vals = {t["key"]: getattr(a, t["key"]) for t in TUNABLES}
+        pend = {k: v for k, v in tuned.items()
+                if k in BY_KEY and BY_KEY[k]["scope"] == "restart"
+                and v != vals.get(k)}
+        return {"values": vals, "pending": pend,
+                "spec": [{k: t[k] for k in
+                          ("key", "label", "kind", "scope", "hint", "choices")}
+                         for t in TUNABLES]}
     # The most recent thickness cam1 produced, independent of whether cam0 is
     # calibrated.
     latest = {"thickness": None}
@@ -754,6 +1127,18 @@ def main():
                 self._send(TOUCH.encode(), "text/html")
             elif self.path == "/state":
                 self._send(snap["json"], "application/json")
+            elif self.path == "/specimens":
+                if SR is None:
+                    body = {"codes": [], "error": "specimen_registry not available"}
+                else:
+                    try:
+                        body = {"codes": SR.list_specimens()}
+                    except Exception as e:
+                        body = {"codes": [], "error": str(e)[:150]}
+                self._send(json.dumps(body).encode(), "application/json")
+            elif self.path == "/settings":
+                self._send(json.dumps(settings_doc()).encode(),
+                           "application/json")
             elif self.path == "/stream0":
                 self._mjpeg(lambda: bottom.cam)     # resolved per frame, so a
             elif self.path == "/stream1":          # swap takes effect live
@@ -762,6 +1147,52 @@ def main():
                 self.send_error(404)
 
         def do_POST(self):
+            if self.path == "/settings":
+                nbytes = int(self.headers.get("Content-Length", 0))
+                try:
+                    req = json.loads(self.rfile.read(nbytes) or b"{}")
+                except Exception:
+                    return self._send(b"settings: could not read the request")
+
+                # Validate EVERY field before changing ANY of them. A partly
+                # applied settings page leaves the station in a state nobody
+                # chose and nobody can see.
+                wanted, bad = {}, []
+                for k, raw in req.items():
+                    t = BY_KEY.get(k)
+                    if t is None:
+                        bad.append(f"{k}: not a setting")
+                    else:
+                        try:
+                            wanted[k] = coerce(t, raw)
+                            if k == "new_fields":
+                                parse_fields(wanted[k])   # fail here, not at Log
+                        except ValueError as e:
+                            bad.append(f"{t['label']}: {e}")
+                if bad:
+                    return self._send(
+                        ("NOTHING CHANGED | " + " | ".join(bad)).encode())
+
+                changed, later = [], []
+                for k, v in wanted.items():
+                    if v == getattr(a, k) and tuned.get(k, v) == v:
+                        continue
+                    t = BY_KEY[k]
+                    if t["scope"] == "restart":
+                        later.append(t["label"])
+                    else:
+                        apply_live(k, v)
+                    tuned[k] = v
+                    changed.append(f"{k}={'(blank)' if v is None else v}")
+                if not changed:
+                    return self._send(b"settings unchanged")
+                save_state()
+                hist.clear()
+                out = f"applied: {', '.join(changed)} | saved to {a.state}"
+                if later:
+                    out += f" | needs a restart: {', '.join(later)}"
+                return self._send(out.encode())
+
             if self.path == "/calibrate":
                 n = int(self.headers.get("Content-Length", 0))
                 try:
@@ -954,6 +1385,7 @@ def main():
                 except Exception:
                     req = {}
                 sid = str(req.get("specimen_id", "")).strip().upper()
+                mode = str(req.get("mode", "existing")).strip().lower()
 
                 row = snap["row"]
                 if not row:
@@ -961,9 +1393,47 @@ def main():
                     # this also guarantees the values below are millimetres.
                     return self._send(b"no complete measurement to log - both "
                                       b"views must be calibrated")
-                row = dict(row, specimen_id=sid)
 
                 out = []
+                if mode == "new":
+                    # Mint the code BEFORE writing the CSV, or the local row gets
+                    # the series prefix ("PS-V4") as its ID and never matches the
+                    # specimen that ends up in the app.
+                    #
+                    # The database's uniqueness on specimen_id is the arbiter, not
+                    # our copy of the list -- the press or another station can take
+                    # a number a second before we do. So: propose, insert, and on
+                    # rejection try the next one. A consequence worth knowing: a
+                    # NEW specimen cannot be created offline. The reading is still
+                    # written to the CSV below, so nothing is lost -- you just have
+                    # to attach it to a code later.
+                    if SR is None:
+                        out.append("specimen_registry not available - no new ID")
+                        sid = ""
+                    else:
+                        try:
+                            # The dashboard reads the dimensions off the
+                            # specimens row itself, so put them in the insert
+                            # that creates it. Doing it now, while we are
+                            # already writing the row, avoids ever having to
+                            # UPDATE a specimen -- the history in
+                            # identifier_measurements stays append-only and
+                            # nothing is overwritten. Anything typed into
+                            # "new specimen fields" wins, so a bad reading can
+                            # still be overridden by hand.
+                            born = {"length_mm": round(float(row["length_mm"]), 2),
+                                    "width_mm": round(float(row["width_mm"]), 2),
+                                    "thickness_mm": round(float(row["thickness_mm"]), 3)}
+                            born.update(parse_fields(a.new_fields))
+                            sid = SR.claim_next(sid or "PS-V4", **born)
+                            out.append(f"created {sid} with "
+                                       + ", ".join(sorted(born)))
+                        except Exception as e:
+                            out.append(f"could not create a specimen "
+                                       f"({str(e)[:220]}) - logged WITHOUT an ID")
+                            sid = ""
+                row = dict(row, specimen_id=sid)
+
                 if a.log:
                     fresh = (not os.path.exists(a.log)
                              or os.path.getsize(a.log) == 0)
@@ -996,7 +1466,18 @@ def main():
                             width_mm=float(row["width_mm"]),
                             thickness_mm=float(row["thickness_mm"]),
                             notes=note)
-                        out.append(f"queued for the app: {f.name}")
+                        # send_measurement returns the outbox file whether or
+                        # not the app took it. The file still being there is
+                        # the only honest signal that it did not -- reporting
+                        # "queued" either way hides a table that is refusing
+                        # every row.
+                        if f.exists():
+                            waiting = len(list(f.parent.glob("*.json")))
+                            out.append(f"NOT accepted by the app - {waiting} "
+                                       f"waiting in outbox/ (see the terminal "
+                                       f"for the reason)")
+                        else:
+                            out.append("measurement accepted by the app")
                     except Exception as e:
                         out.append(f"PUSH FAILED: {str(e)[:120]}")
                 return self._send(" | ".join(out).encode())

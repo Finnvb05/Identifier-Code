@@ -29,3 +29,7 @@ frame*.png
 # --- python ---
 __pycache__/
 *.pyc
+
+# --- secrets and queue: NEVER commit ---
+stark_ingest.conf
+outbox/

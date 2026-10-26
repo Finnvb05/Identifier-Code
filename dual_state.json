@@ -1,1 +1,22 @@
-{"swapped": true, "roi0": [0.05, 0.1, 0.99, 0.927], "roi1": [0.05, 0.1, 0.95, 0.59]}
+{
+ "swapped": true,
+ "roi0": [
+  0.05,
+  0.1,
+  0.99,
+  0.927
+ ],
+ "roi1": [
+  0.05,
+  0.1,
+  0.95,
+  0.59
+ ],
+ "settings": {
+  "plane_offset": 0.0,
+  "datum1": "none",
+  "note": "-",
+  "profile_csv": "",
+  "new_fields": "species=TEST, grain=TEST"
+ }
+}
