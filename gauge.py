@@ -454,6 +454,15 @@ def valid_band(pos, lo, hi):
     a1, b1 = run_of(lo)
     a2, b2 = run_of(hi)
     a, b = max(a1, a2), min(b1, b2)         # both edges must be valid together
+    if b <= a:
+        # The two runs do not overlap. That happens on a THIN specimen, where
+        # few lines cross it and the step statistics fragment into pieces the
+        # two edges disagree about -- not because the specimen is rotated.
+        # Intersecting disjoint runs used to return a negative-width band,
+        # which _span reported as "only -152 rows cross both end faces".
+        # Corner trimming is a refinement, not a requirement: keep every line
+        # and let the residual check in _check_fit judge the fit.
+        return 0, int(np.asarray(pos).size) - 1
     return a, b
 
 

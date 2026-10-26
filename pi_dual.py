@@ -156,6 +156,24 @@ class Role:
         if self.ref_file and os.path.exists(self.ref_file):
             os.remove(self.ref_file)
 
+    def set_roi(self, spec):
+        """Change the ROI while running. spec is 'x0,y0,x1,y1' -- pixels, or
+        fractions of the frame when every value is <= 1 -- or blank for auto."""
+        if spec is None or not str(spec).strip() or str(spec).strip().lower() in (
+                "auto", "none"):
+            self.roi_spec, self.roi_frac = None, False
+            return "auto"
+        vals = [float(v) for v in str(spec).replace(" ", "").split(",")]
+        if len(vals) != 4:
+            raise ValueError("need four numbers: x0,y0,x1,y1")
+        if vals[0] >= vals[2] or vals[1] >= vals[3]:
+            raise ValueError("need x0 < x1 and y0 < y1")
+        if min(vals) < 0:
+            raise ValueError("values cannot be negative")
+        self.roi_spec = vals
+        self.roi_frac = all(v <= 1.0 for v in vals)
+        return "fractions" if self.roi_frac else "pixels"
+
     def find_roi(self, img):
         """Resolve the ROI and remember it for the preview overlay."""
         self.last_w = img.shape[1]
@@ -272,6 +290,12 @@ border-radius:6px}
   <select id="ax"><option value="length">length</option><option value="width">width</option></select>
   <button onclick="cal()">Calibrate</button>
   <button onclick="post('/log')">Log</button>
+  <div class="lab">Region of interest</div>
+  <div class="sub">x0,y0,x1,y1 -- pixels, or fractions of the frame when all are
+   &le; 1. Blank for auto. Uses the view selected above.</div>
+  <input id="roi" placeholder="0.17,0.10,0.97,0.44" style="width:240px">
+  <button onclick="setroi()">Set ROI</button>
+  <button onclick="el('roi').value='';setroi()" style="background:#555">Auto</button>
   <div class="lab">Empty-fixture reference</div>
   <div class="sub">Remove the coupon, then capture. Divides out the fixture and the
    backlight's unevenness. Uses the view selected above.</div>
@@ -309,6 +333,8 @@ async function poll(){
    row('side tilt',s.tilt1===null?'--':s.tilt1.toFixed(2)+' deg')+
    row('pairing','bottom=sensor '+s.sensor0+', side=sensor '+s.sensor1,
        s.swapped?'warn':'')+
+   row('bottom ROI',s.roi0?s.roi0.join(', '):'--')+
+   row('side ROI',s.roi1?s.roi1.join(', '):'--')+
    row('bottom reference',s.ref0?'on':'off',s.ref0?'ok':'warn')+
    row('bottom datum',s.datum0?s.datum0+', offset '+s.doff0.toFixed(2)+' px':'none (two edges)')+
    row('side datum',s.datum1?s.datum1+', offset '+s.doff1.toFixed(2)+' px':'none (two edges)')+
@@ -335,6 +361,11 @@ async function cal(){const v=parseFloat(el('km').value);
   headers:{'Content-Type':'application/json'},
   body:JSON.stringify({known_mm:v,camera:parseInt(el('cam').value),
    axis:el('ax').value})})).text())}
+async function setroi(){say('setting ROI...');
+ say(await (await fetch('/roi',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({camera:parseInt(el('cam').value),
+   roi:el('roi').value})})).text())}
 async function ref(action){
  if(action==='capture'&&!confirm('Is the fixture EMPTY? The reference must not contain a coupon.'))return;
  say(action==='capture'?'capturing reference...':'clearing...');
@@ -483,24 +514,38 @@ def main():
     side = Role("side", a.eff_dist1, a.roi1, a.prominence,
                 a.calib1, a.max_residual, a.ref1, a.datum1)
 
-    # Persist the pairing so a restart can't silently revert it.
-    def load_swap():
+    # Persist the pairing and the ROIs so a restart can't silently revert them.
+    def load_state():
         try:
-            return bool(json.load(open(a.state)).get("swapped", False))
+            return json.load(open(a.state))
         except Exception:
-            return False
+            return {}
 
-    swapped = {"v": a.swap or load_swap()}
+    state = load_state()
+    swapped = {"v": a.swap or bool(state.get("swapped", False))}
 
     def bind():
         i, j = (1, 0) if swapped["v"] else (0, 1)
         bottom.cam, side.cam = cams[i], cams[j]
 
-    def save_swap():
+    def save_state():
         try:
-            json.dump({"swapped": swapped["v"]}, open(a.state, "w"))
+            json.dump({"swapped": swapped["v"],
+                       "roi0": bottom.roi_spec,
+                       "roi1": side.roi_spec}, open(a.state, "w"))
         except Exception as e:
             print(f"# could not save {a.state}: {e}")
+
+    # A --roi flag on the command line beats the stored one; otherwise the ROI
+    # you dialled in last session is still there.
+    for role, cli, key in ((bottom, a.roi0, "roi0"), (side, a.roi1, "roi1")):
+        if cli is None and state.get(key):
+            try:
+                role.set_roi(",".join(str(v) for v in state[key]))
+                print(f"# {role.name}: ROI {role.roi_spec} restored "
+                      f"from {a.state}")
+            except Exception as e:
+                print(f"# {role.name}: ignoring bad saved ROI: {e}")
 
     bind()
     time.sleep(1.5)
@@ -548,10 +593,21 @@ def main():
                 # Whichever role is bound to this sensor right now -- so the overlay
                 # follows a camera swap without restarting anything.
                 role = bottom if bottom.cam is cam else side
+                box = None
                 if role.last_roi and role.last_w:
                     k = bgr.shape[1] / role.last_w
-                    x0, y0, x1, y1 = (int(v * k) for v in role.last_roi)
-                    cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 200, 255), 1)
+                    box = [int(v * k) for v in role.last_roi]
+                elif role.roi_spec and role.roi_frac:
+                    # No successful measurement yet -- grab() may be refusing the
+                    # frame -- but a fractional ROI resolves against any size, so
+                    # show it anyway. Otherwise a working ROI looks like a broken
+                    # button.
+                    h, w = bgr.shape[:2]
+                    box = [int(role.roi_spec[0] * w), int(role.roi_spec[1] * h),
+                           int(role.roi_spec[2] * w), int(role.roi_spec[3] * h)]
+                if box:
+                    cv2.rectangle(bgr, (box[0], box[1]), (box[2], box[3]),
+                                  (0, 200, 255), 1)
                 ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 if ok:
                     cam.jpeg = buf.tobytes()
@@ -571,7 +627,9 @@ def main():
                  "sensor0": bottom.cam.index, "sensor1": side.cam.index,
                  "length_mm": None, "width_mm": None, "thickness_mm": None,
                  "delta_mm": None, "tilt0": None, "tilt1": None,
-                 "rms0": None, "rms1": None, "tsd": None, "n": len(hist)}
+                 "rms0": None, "rms1": None, "tsd": None, "n": len(hist),
+                 "roi0": list(bottom.last_roi) if bottom.last_roi else None,
+                 "roi1": list(side.last_roi) if side.last_roi else None}
             row = None
 
             # --- SIDE FIRST: it produces the thickness the bottom camera needs.
@@ -822,13 +880,33 @@ def main():
                         "their true place")
                 return self._send(msg.encode())
 
+            if self.path == "/roi":
+                n = int(self.headers.get("Content-Length", 0))
+                try:
+                    req = json.loads(self.rfile.read(n) or b"{}")
+                    which = int(req.get("camera", 0))
+                    spec = req.get("roi", "")
+                except Exception as e:
+                    return self._send(f"bad request: {e}".encode())
+                role = bottom if which == 0 else side
+                try:
+                    kind = role.set_roi(spec)
+                except Exception as e:
+                    return self._send(f"bad ROI: {e}".encode())
+                hist.clear()
+                save_state()
+                return self._send(
+                    (f"{role.name}: ROI now {kind}"
+                     + ("" if kind == "auto" else f" {role.roi_spec}")
+                     + " - watch the overlay and the status rows").encode())
+
             if self.path == "/swap":
                 swapped["v"] = not swapped["v"]
                 # A reference is a picture of what one sensor saw from one place.
                 bottom.clear_reference()
                 side.clear_reference()
                 bind()
-                save_swap()
+                save_state()
                 # The thickness history describes the old pairing; keeping it would
                 # blend two different geometries into one spread figure.
                 hist.clear()
