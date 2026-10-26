@@ -1,0 +1,11 @@
+{
+  "focalPx": 4087.0704,
+  "effDist": 300.0,
+  "when": "2026-10-26T12:18:45+00:00",
+  "image": "live-side",
+  "known_mm": 25.0,
+  "axis": "width",
+  "thickness": 0.0,
+  "imageWidth": 4056,
+  "datumOffsetPx": 0.0
+}

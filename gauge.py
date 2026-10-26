@@ -263,15 +263,33 @@ class Reference:
         self.ring = grown & ~self.mask
         self.masked_frac = float(self.mask.mean())
 
-    def apply(self, img):
-        """Return (flattened image, touch count)."""
+    def apply(self, img, box=None):
+        """Return (flattened image, touch count).
+
+        Returns (flattened image, dark ring pixels, total ring pixels). The
+        caller wants the RATIO: a handful of dark ring pixels is noise, most
+        of the ring going dark is a specimen edge buried in the fixture.
+
+        `box` limits the contact count to one ROI. Counting the whole frame
+        counts the ring around every hole in the mask, deep in the fixture
+        where the reference sits near the opaque threshold and the division
+        gain is large enough for noise alone to read dark. That is tens of
+        thousands of pixels nowhere near the specimen.
+        """
         if img.shape != self.ref.shape:
             raise ValueError(f"reference is {self.ref.shape[1]}x{self.ref.shape[0]}, "
                              f"frame is {img.shape[1]}x{img.shape[0]} - recapture it")
         out = img * (self.bright / np.maximum(self.ref, 1.0))
         out[self.mask] = self.bright
-        touch = int((out[self.ring] < 0.5 * self.bright).sum())
-        return out.astype(np.float32), touch
+        ring = self.ring
+        if box is not None:
+            x0, y0, x1, y1 = (int(v) for v in box)
+            sub = np.zeros_like(ring)
+            sub[y0:y1, x0:x1] = True
+            ring = ring & sub
+        n = int(ring.sum())
+        touch = int((out[ring] < 0.5 * self.bright).sum()) if n else 0
+        return out.astype(np.float32), touch, n
 
 
 def auto_roi(img: np.ndarray, margin: int = 40, min_prominence: float = 3.0,
@@ -460,9 +478,12 @@ def valid_band(pos, lo, hi):
         # two edges disagree about -- not because the specimen is rotated.
         # Intersecting disjoint runs used to return a negative-width band,
         # which _span reported as "only -152 rows cross both end faces".
-        # Corner trimming is a refinement, not a requirement: keep every line
-        # and let the residual check in _check_fit judge the fit.
-        return 0, int(np.asarray(pos).size) - 1
+        # Keep the LONGER of the two runs: a contiguous stretch one edge is
+        # self-consistent over. Keeping every line instead lets through the
+        # very lines this trimming exists to remove -- on a mottled backlight
+        # those are rows with no specimen at all, and the fit residual
+        # explodes.
+        return (a1, b1) if (b1 - a1) >= (b2 - a2) else (a2, b2)
     return a, b
 
 

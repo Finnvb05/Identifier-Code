@@ -23,6 +23,11 @@ from picamera2 import Picamera2
 import chord_measure as C
 import gauge as G
 
+try:                      # optional: push each logged row to the PaperSteel app
+    from identifier_push import send_measurement
+except Exception:         # not installed, or no stark_ingest.conf yet
+    send_measurement = None
+
 
 # ------------------------------------------------------------------ camera --
 
@@ -113,13 +118,22 @@ class Role:
         if self.ref is None:
             self.touch = 0
             return img
-        img, self.touch = self.ref.apply(img)
-        if self.touch > 20 and not self.datum:   # contact is expected on a datum
-            # Refuse rather than report.
+        # Count contact only inside the ROI -- the only region that can change
+        # the result. Before the first successful measurement there is no ROI
+        # yet, so record the figure but do not refuse on it.
+        img, self.touch, ring_n = self.ref.apply(img, self.last_roi)
+        # A RATIO, not a count. The ring follows every hole in the mask, and in
+        # the fixture region the division gain is large enough that noise alone
+        # reads dark -- tens of thousands of pixels nowhere near the specimen.
+        # An edge genuinely buried in the fixture darkens most of the ring it
+        # touches, so a quarter of it is a wide margin either way.
+        frac = (self.touch / ring_n) if ring_n else 0.0
+        if (self.last_roi and not self.datum
+                and ring_n > 200 and frac > 0.25):
             raise RuntimeError(
                 f"{self.name}: coupon edge is behind the opaque part of the "
-                f"fixture ({self.touch} px in contact) - reseat it so the edge "
-                f"is visible")
+                f"fixture ({frac*100:.0f}% of the boundary, {self.touch} of "
+                f"{ring_n} px) - reseat it so the edge is visible")
         return img
 
     def capture_reference(self, n):
@@ -289,7 +303,10 @@ border-radius:6px}
    <option value="1">side</option></select>
   <select id="ax"><option value="length">length</option><option value="width">width</option></select>
   <button onclick="cal()">Calibrate</button>
-  <button onclick="post('/log')">Log</button>
+  <div class="lab">Specimen</div>
+  <input id="sid" placeholder="PS-V4-038" style="width:150px"
+   oninput="this.value=this.value.toUpperCase()">
+  <button onclick="logrow()">Log</button>
   <div class="lab">Region of interest</div>
   <div class="sub">x0,y0,x1,y1 -- pixels, or fractions of the frame when all are
    &le; 1. Blank for auto. Uses the view selected above.</div>
@@ -351,6 +368,11 @@ async function poll(){
 async function post(u){say('working...');
  const t=await (await fetch(u,{method:'POST'})).text();
  if(u==='/profile'){el('pf').textContent=t;say('profiled')}else{say(t)}}
+async function logrow(){const s=el('sid')?el('sid').value.trim():'';
+ say('logging...');
+ say(await (await fetch('/log',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({specimen_id:s})})).text())}
 // Side view: label the small axis 'thickness' (value stays 'width').
 function axes(){var side=el('cam').value==='1';
  el('ax').options[1].text=side?'thickness':'width'}
@@ -409,7 +431,9 @@ button:active{background:#256b4c}
  <select id="ax"><option value="length">length</option><option value="width">width</option></select>
 </div>
 <button onclick="cal()">Calibrate</button>
-<button onclick="post('/log')">Log reading</button>
+<input id="sid" placeholder="PS-V4-038" style="width:100%;margin-top:9px"
+ oninput="this.value=this.value.toUpperCase()">
+<button onclick="logrow()">Log reading</button>
 <button onclick="post('/profile')">Profile</button>
 <button onclick="if(confirm('Swap cameras? Recalibrate after.'))post('/swap')"
  style="background:#7d5a2d">Swap cameras</button>
@@ -433,6 +457,11 @@ async function poll(){
 async function post(u){say('working...');
  const t=await (await fetch(u,{method:'POST'})).text();
  if(u==='/profile'){el('pf').textContent=t;say('profiled')}else{say(t)}}
+async function logrow(){const s=el('sid')?el('sid').value.trim():'';
+ say('logging...');
+ say(await (await fetch('/log',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({specimen_id:s})})).text())}
 // Side view: label the small axis 'thickness' (value stays 'width').
 function axes(){var side=el('cam').value==='1';
  el('ax').options[1].text=side?'thickness':'width'}
@@ -447,7 +476,7 @@ poll();
 </script></body></html>"""
 
 
-LOG_COLS = ["when", "length_mm", "width_mm", "thickness_mm", "length_side_mm",
+LOG_COLS = ["when", "specimen_id", "length_mm", "width_mm", "thickness_mm", "length_side_mm",
             "delta_mm", "length_px", "width_px", "thickness_px", "length_side_px",
             "tilt0_deg", "tilt1_deg", "rms0_px", "rms1_px",
             "focalPx0", "effDist0", "focalPx1", "effDist1", "roi0", "roi1", "note"]
@@ -919,18 +948,58 @@ def main():
                      ).encode())
 
             if self.path == "/log":
-                if not a.log:
-                    return self._send(b"no --log file given")
+                nbytes = int(self.headers.get("Content-Length", 0))
+                try:
+                    req = json.loads(self.rfile.read(nbytes) or b"{}")
+                except Exception:
+                    req = {}
+                sid = str(req.get("specimen_id", "")).strip().upper()
+
                 row = snap["row"]
                 if not row:
-                    return self._send(b"no complete measurement to log")
-                new = not os.path.exists(a.log) or os.path.getsize(a.log) == 0
-                with open(a.log, "a", newline="") as fh:
-                    w = csv.DictWriter(fh, fieldnames=LOG_COLS)
-                    if new:
-                        w.writeheader()
-                    w.writerow(row)
-                return self._send(f"logged to {a.log}".encode())
+                    # snap["row"] only exists once BOTH views are calibrated, so
+                    # this also guarantees the values below are millimetres.
+                    return self._send(b"no complete measurement to log - both "
+                                      b"views must be calibrated")
+                row = dict(row, specimen_id=sid)
+
+                out = []
+                if a.log:
+                    fresh = (not os.path.exists(a.log)
+                             or os.path.getsize(a.log) == 0)
+                    with open(a.log, "a", newline="") as fh:
+                        w = csv.DictWriter(fh, fieldnames=LOG_COLS)
+                        if fresh:
+                            w.writeheader()
+                        w.writerow(row)
+                    out.append(f"logged to {a.log}")
+                else:
+                    out.append("no --log file given")
+
+                if not sid:
+                    out.append("no specimen ID - not sent to the app")
+                elif send_measurement is None:
+                    out.append("identifier_push not available - not sent")
+                else:
+                    # Carry the provenance the app's table cannot hold yet, so a
+                    # row can still be judged later: the two cameras' independent
+                    # lengths, the fit quality, and the thickness spread.
+                    note = (f"delta {row['delta_mm']} mm | "
+                            f"rms {row['rms0_px']}/{row['rms1_px']} px | "
+                            f"tilt {row['tilt0_deg']}/{row['tilt1_deg']} deg")
+                    if a.note:
+                        note = f"{a.note} | {note}"
+                    try:
+                        f = send_measurement(
+                            sid,
+                            length_mm=float(row["length_mm"]),
+                            width_mm=float(row["width_mm"]),
+                            thickness_mm=float(row["thickness_mm"]),
+                            notes=note)
+                        out.append(f"queued for the app: {f.name}")
+                    except Exception as e:
+                        out.append(f"PUSH FAILED: {str(e)[:120]}")
+                return self._send(" | ".join(out).encode())
             self.send_error(404)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
