@@ -672,6 +672,11 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
     cp, cv = _edge_points(small_arr, cfg, from_end, hw)
     clear = (dline.slope * cp + dline.icept - cv) * (-1 if from_end else 1) > 5
     cp, cv = cp[clear], cv[clear]                 # lines that actually cross the specimen
+    # The specimen's true extent, before edgeTrim pulls the ends in. The trim
+    # is there to keep clipped corners out of the FIT; the fitted line is still
+    # valid across the whole span, and the contact point we need sits at an
+    # untrimmed end.
+    span_lo, span_hi = (float(cp.min()), float(cp.max())) if cp.size else (0.0, 0.0)
     if cp.size > 40 and cfg.edgeTrim > 0:
         sp = cp.max() - cp.min()
         k = (cp >= cp.min() + cfg.edgeTrim * sp) & (cp <= cp.max() - cfg.edgeTrim * sp)
@@ -686,16 +691,44 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
     m = 0.5 * (dline.slope + cline.slope)
     k = 1.0 / np.sqrt(1 + m * m)
     per_line = np.abs(dline.slope * cp + dline.icept - cv) * k + offset_px
-    at = float(np.median(cp))
-    small_px = abs((dline.slope - cline.slope) * at + dline.icept - cline.icept) * k \
-        + offset_px
+
+    # WHERE to evaluate the datum-to-edge distance.
+    #
+    # The datum stands in for the specimen's hidden near edge. That is only the
+    # same line when the specimen is square to the fixture. Yawed by a fraction
+    # of a degree it touches at ONE point and splays away along its length, and
+    # the two fitted lines diverge. Measured at the specimen's midpoint -- the
+    # obvious choice, and what this did before -- the result then carries half
+    # the splay: a quarter of a degree over a 1900 px lever is 8 px, 0.6 mm on
+    # a typical bottom view. It looks like a calibration error, moves when the
+    # specimen is reseated, and leaves the edge fits perfectly straight, so
+    # nothing else in the output gives it away.
+    #
+    # The specimen's two long edges are parallel, so its near edge is the line
+    # with the SPECIMEN's slope through the contact point, and the contact is
+    # where the fitted lines come closest -- for straight lines, one end of the
+    # span. Evaluate there. Both ends agree for a square specimen, so a
+    # well-seated measurement is unchanged.
+    def sep_at(x):
+        return abs((dline.slope - cline.slope) * x
+                   + dline.icept - cline.icept) * k
+
+    lo, hi = span_lo, span_hi
+    small_px = min(sep_at(lo), sep_at(hi)) + offset_px
+
+    # Report the skew so it can never be invisible again. splay_px is what the
+    # old midpoint rule would have added; edgeTrim has already pulled the span
+    # in, so a little of it survives the correction.
+    skew_deg = float(np.degrees(np.arctan(cline.slope) - np.arctan(dline.slope)))
+    splay_px = float(abs(sep_at(lo) - sep_at(hi)))
 
     mmpx = cfg.mmPerPx(thickness)
     tilt = np.arctan(0.5 * (fa.slope + fb.slope)) if fa else -np.arctan(m)
     rms = np.mean([fa.rms, fb.rms, cline.rms]) if fa else cline.rms
     r = Result(small_px * mmpx, free_px * mmpx, small_px, free_px, mmpx * 1000,
                float(np.degrees(tilt)), float(rms))
-    return r, {"pos": cp, "small_px": per_line, "datum": dline, "edge": cline}
+    return r, {"pos": cp, "small_px": per_line, "datum": dline, "edge": cline,
+               "skew_deg": skew_deg, "splay_px": splay_px}
 
 
 def run(cfg: Config, thickness: Optional[float]) -> None:

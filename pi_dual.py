@@ -282,6 +282,18 @@ class Role:
         k = c.mmPerPx(thickness) if self.focalPx > 0 else 0.0
         return r, c, k
 
+    def skew(self):
+        """Degrees between the fixture's datum line and the specimen's edge.
+
+        Zero when the specimen is square to the fixture. It is reported because
+        a datum measurement silently degrades with skew and nothing else in the
+        output shows it: the edge fits stay perfectly straight either way.
+        """
+        if not self.datum or not self.extras:
+            return None
+        v = self.extras.get("skew_deg")
+        return None if v is None else float(v)
+
     def calibrate(self, px, known_mm, axis, thickness, width):
         if not np.isfinite(px):
             raise ValueError(f"{self.name}: {axis} not measurable in this frame")
@@ -342,6 +354,14 @@ color:#7d7d7d;padding:8px 0}
 border-bottom:1px solid #2a2a2a}
 .cfgrow label{flex:1;font-size:13px;color:#ccc}
 .cfgrow input,.cfgrow select{width:170px;flex:none}
+.combo{position:relative;display:inline-block}
+.droplist{display:none;position:absolute;z-index:9;left:0;top:calc(100% + 2px);
+min-width:200px;max-height:280px;overflow:auto;background:#242424;
+border:1px solid #3a3a3a;border-radius:6px;box-shadow:0 6px 18px #0009}
+.dropitem{padding:7px 11px;cursor:pointer;font:13px ui-monospace,monospace;
+white-space:nowrap}
+.dropitem:hover{background:#2d7d5a}
+.dropitem.dim{color:#888;cursor:default}
 </style></head><body>
 <div class="wrap">
  <div class="cam"><img src="/stream0"><div class="cap" id="cap0">bottom - length &amp; width</div></div>
@@ -362,9 +382,10 @@ border-bottom:1px solid #2a2a2a}
   <div class="lab">Specimen</div>
   <select id="smode" onchange="smode()">
    <option value="existing">existing</option><option value="new">new</option></select>
-  <input id="sid" list="slist" placeholder="PS-V4-038" style="width:150px"
-   oninput="this.value=this.value.toUpperCase()">
-  <datalist id="slist"></datalist>
+  <span class="combo"><input id="sid" placeholder="PS-V4-038" style="width:170px"
+    autocomplete="off" oninput="this.value=this.value.toUpperCase();filtersp()"
+    onfocus="opensp()" onblur="setTimeout(hidesp,180)"
+   ><div id="splist" class="droplist"></div></span>
   <button onclick="getspecimens()" style="background:#555">Refresh list</button>
   <button onclick="logrow()">Log</button>
   <div class="lab">Region of interest</div>
@@ -416,6 +437,12 @@ async function poll(){
    row('bottom edge RMS',s.rms0===null?'--':s.rms0.toFixed(3)+' px')+
    row('side edge RMS',s.rms1===null?'--':s.rms1.toFixed(3)+' px')+
    row('bottom tilt',s.tilt0===null?'--':s.tilt0.toFixed(2)+' deg')+
+   (s.skew0===null||s.skew0===undefined?'':
+    row('bottom datum skew',s.skew0.toFixed(3)+' deg',
+        Math.abs(s.skew0)>0.05?'warn':'ok'))+
+   (s.skew1===null||s.skew1===undefined?'':
+    row('side datum skew',s.skew1.toFixed(3)+' deg',
+        Math.abs(s.skew1)>0.05?'warn':'ok'))+
    row('side tilt',s.tilt1===null?'--':s.tilt1.toFixed(2)+' deg')+
    row('pairing','bottom=sensor '+s.sensor0+', side=sensor '+s.sensor1,
        s.swapped?'warn':'')+
@@ -425,8 +452,10 @@ async function poll(){
    row('bottom datum',s.datum0?s.datum0+', offset '+s.doff0.toFixed(2)+' px':'none (two edges)')+
    row('side datum',s.datum1?s.datum1+', offset '+s.doff1.toFixed(2)+' px':'none (two edges)')+
    row('side reference',s.ref1?'on':'off',s.ref1?'ok':'warn')+
-   (s.touch0>0?row('bottom','coupon touching opaque fixture - edge hidden','bad'):'')+
-   (s.touch1>0?row('side','coupon touching opaque fixture - edge hidden','bad'):'')+
+   (s.touch0>0&&!s.datum0?
+    row('bottom','coupon touching opaque fixture - edge hidden','bad'):'')+
+   (s.touch1>0&&!s.datum1?
+    row('side','coupon touching opaque fixture - edge hidden','bad'):'')+
    row('plane',s.fixedPlane===null||s.fixedPlane===undefined?
        'floating (uses measured thickness)':'fixed at '+s.fixedPlane+' mm')+
    row('thickness 1s',s.tsd===null?'--':(s.tsd*1000).toFixed(1)+' um over '+s.n)+
@@ -464,13 +493,28 @@ async function savecfg(){var o={};
  say(await (await fetch('/settings',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})).text());
  loadcfg()}
+var SPEC=[];
 function smode(){var n=el('smode').value==='new';
  el('sid').placeholder=n?'PS-V4   (series)':'PS-V4-038';
- el('sid').setAttribute('list',n?'':'slist')}
-async function getspecimens(){say('fetching specimen list...');
+ hidesp()}
+function hidesp(){el('splist').style.display='none'}
+function picksp(c){el('sid').value=c;hidesp()}
+function opensp(){if(!SPEC.length){getspecimens(1)}else{filtersp()}}
+function filtersp(){
+ if(el('smode').value!=='existing'){return hidesp()}
+ var q=el('sid').value.trim().toUpperCase(),o;
+ var m=SPEC.filter(function(c){return c.indexOf(q)>=0});
+ if(m.length){o=m.slice(0,60).map(function(c){
+   return '<div class="dropitem" onmousedown="picksp(\''+c+'\')">'+c+'</div>'}).join('')
+   +(m.length>60?'<div class="dropitem dim">'+(m.length-60)+' more - keep typing</div>':'')}
+ else{o='<div class="dropitem dim">'+(SPEC.length?'no match':'list not loaded')+'</div>'}
+ el('splist').innerHTML=o;el('splist').style.display='block'}
+async function getspecimens(quiet){if(!quiet){say('fetching specimen list...')}
  try{const r=await (await fetch('/specimens')).json();
-  el('slist').innerHTML=r.codes.map(c=>'<option value="'+c+'">').join('');
-  say(r.error?('list failed: '+r.error):(r.codes.length+' specimens loaded'))}
+  SPEC=r.codes||[];
+  if(r.error){say('list failed: '+r.error)}
+  else if(!quiet){say(SPEC.length+' specimens loaded')}
+  filtersp()}
  catch(e){say('could not reach the app')}}
 async function logrow(){
  say('logging...');
@@ -530,6 +574,13 @@ text-transform:uppercase;padding:10px 0}
 .cfgrow{display:flex;align-items:center;gap:10px;margin:8px 0}
 .cfgrow label{flex:1;font-size:15px;color:#ccc}
 .cfgrow input,.cfgrow select{width:150px;flex:none;min-height:50px;font-size:20px}
+.combo{position:relative}
+.droplist{display:none;position:absolute;z-index:9;left:0;bottom:calc(100% + 4px);
+width:100%;max-height:44vh;overflow:auto;background:#242424;
+border:1px solid #3a3a3a;border-radius:11px;box-shadow:0 6px 22px #000b}
+.dropitem{padding:15px 14px;font:21px ui-monospace,monospace;
+border-bottom:1px solid #2e2e2e}
+.dropitem.dim{color:#888}
 .stale{color:#8a5a52 !important}
 </style></head><body><div class="pane">
 <div><div class="lab">Length</div><div class="val" id="L">--</div></div>
@@ -548,9 +599,11 @@ text-transform:uppercase;padding:10px 0}
 <div class="row" style="margin-top:9px">
  <select id="smode" onchange="smode()" style="flex:0 0 38%">
   <option value="existing">existing</option><option value="new">new</option></select>
- <input id="sid" list="slist" placeholder="PS-V4-038"
-  oninput="this.value=this.value.toUpperCase()">
- <datalist id="slist"></datalist>
+ <span class="combo" style="flex:1"><input id="sid" placeholder="PS-V4-038"
+   style="width:100%" autocomplete="off"
+   oninput="this.value=this.value.toUpperCase();filtersp()"
+   onfocus="opensp()" onblur="setTimeout(hidesp,250)"
+  ><div id="splist" class="droplist"></div></span>
 </div>
 <button onclick="logrow()">Log reading</button>
 <button onclick="getspecimens()" style="background:#555">Refresh specimen list</button>
@@ -611,13 +664,28 @@ async function savecfg(){var o={};
  say(await (await fetch('/settings',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})).text());
  loadcfg()}
+var SPEC=[];
 function smode(){var n=el('smode').value==='new';
  el('sid').placeholder=n?'PS-V4   (series)':'PS-V4-038';
- el('sid').setAttribute('list',n?'':'slist')}
-async function getspecimens(){say('fetching specimen list...');
+ hidesp()}
+function hidesp(){el('splist').style.display='none'}
+function picksp(c){el('sid').value=c;hidesp()}
+function opensp(){if(!SPEC.length){getspecimens(1)}else{filtersp()}}
+function filtersp(){
+ if(el('smode').value!=='existing'){return hidesp()}
+ var q=el('sid').value.trim().toUpperCase(),o;
+ var m=SPEC.filter(function(c){return c.indexOf(q)>=0});
+ if(m.length){o=m.slice(0,60).map(function(c){
+   return '<div class="dropitem" onmousedown="picksp(\''+c+'\')">'+c+'</div>'}).join('')
+   +(m.length>60?'<div class="dropitem dim">'+(m.length-60)+' more - keep typing</div>':'')}
+ else{o='<div class="dropitem dim">'+(SPEC.length?'no match':'list not loaded')+'</div>'}
+ el('splist').innerHTML=o;el('splist').style.display='block'}
+async function getspecimens(quiet){if(!quiet){say('fetching specimen list...')}
  try{const r=await (await fetch('/specimens')).json();
-  el('slist').innerHTML=r.codes.map(c=>'<option value="'+c+'">').join('');
-  say(r.error?('list failed: '+r.error):(r.codes.length+' specimens loaded'))}
+  SPEC=r.codes||[];
+  if(r.error){say('list failed: '+r.error)}
+  else if(!quiet){say(SPEC.length+' specimens loaded')}
+  filtersp()}
  catch(e){say('could not reach the app')}}
 async function logrow(){
  say('logging...');
@@ -641,7 +709,7 @@ poll();
 
 LOG_COLS = ["when", "specimen_id", "length_mm", "width_mm", "thickness_mm", "length_side_mm",
             "delta_mm", "length_px", "width_px", "thickness_px", "length_side_px",
-            "tilt0_deg", "tilt1_deg", "rms0_px", "rms1_px",
+            "skew0_deg", "skew1_deg", "tilt0_deg", "tilt1_deg", "rms0_px", "rms1_px",
             "focalPx0", "effDist0", "focalPx1", "effDist1", "roi0", "roi1", "note"]
 
 
@@ -971,6 +1039,10 @@ def main():
             "thickness_px": f"{r1.width_px:.4f}",
             "length_side_px": (f"{r1.length_px:.4f}"
                                if np.isfinite(r1.length_px) else ""),
+            "skew0_deg": ("" if d.get("skew0") is None
+                          else f"{d['skew0']:+.4f}"),
+            "skew1_deg": ("" if d.get("skew1") is None
+                          else f"{d['skew1']:+.4f}"),
             "tilt0_deg": f"{r0.tilt_deg:+.4f}",
             "tilt1_deg": f"{r1.tilt_deg:+.4f}",
             "rms0_px": f"{r0.edge_rms_px:.4f}",
@@ -1030,6 +1102,7 @@ def main():
                  "length_mm": None, "width_mm": None, "thickness_mm": None,
                  "delta_mm": None, "tilt0": None, "tilt1": None,
                  "rms0": None, "rms1": None, "tsd": None, "n": len(hist),
+                 "skew0": None, "skew1": None,
                  "roi0": list(bottom.last_roi) if bottom.last_roi else None,
                  "roi1": list(side.last_roi) if side.last_roi else None}
             row = None
@@ -1042,6 +1115,7 @@ def main():
                 img1 = side.grab()
                 r1, c1, k1 = side.measure(img1, 0.0)
                 d["tilt1"], d["rms1"] = float(r1.tilt_deg), float(r1.edge_rms_px)
+                d["skew1"] = side.skew()
                 d["thickness_mm"] = float(r1.width_px * k1) if k1 else float(r1.width_px)
                 if k1:
                     latest["thickness"] = float(r1.width_px * k1)
@@ -1059,6 +1133,7 @@ def main():
                 img0 = bottom.grab()
                 r0, c0, _ = bottom.measure(img0, 0.0)
                 d["tilt0"], d["rms0"] = float(r0.tilt_deg), float(r0.edge_rms_px)
+                d["skew0"] = bottom.skew()
                 k0 = (c0.mmPerPx(specT)
                       if (bottom.focalPx > 0 and specT is not None) else 0.0)
                 d["length_mm"] = float(r0.length_px * k0) if k0 else float(r0.length_px)
