@@ -1,0 +1,8 @@
+# ~/.config/autostart/identifier-kiosk.desktop
+[Desktop Entry]
+Type=Application
+Name=Identifier kiosk
+Comment=Full-screen touchscreen page for the identification station
+Exec=/home/papersteel/kiosk.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

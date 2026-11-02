@@ -1,0 +1,32 @@
+# /etc/systemd/system/papersteel-identifier.service
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now papersteel-identifier
+#   journalctl -u papersteel-identifier -f
+#
+# Everything the station needs is in dual_state.json next to pi_dual.py, so
+# there are no flags here. Add one ONLY if you mean it to override the saved
+# setting permanently -- a flag on the command line makes the station forget
+# the stored value for that setting.
+
+[Unit]
+Description=PaperSteel identification station (pi_dual)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=papersteel
+WorkingDirectory=/home/papersteel/Documents/Identifier Code
+ExecStart=/usr/bin/python3 pi_dual.py
+
+# The cameras can be busy for a moment after a reboot, and a measuring station
+# that is silently absent is worse than one that restarts in your face.
+Restart=always
+RestartSec=5
+
+# Journal only. The CSV is the measurement record; this is just chatter.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

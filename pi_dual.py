@@ -24,9 +24,9 @@ import chord_measure as C
 import gauge as G
 
 try:                      # optional: push each logged row to the PaperSteel app
-    from identifier_push import send_measurement
+    from identifier_push import send_measurement, ALLOWED as APP_ALLOWED
 except Exception:         # not installed, or no stark_ingest.conf yet
-    send_measurement = None
+    send_measurement, APP_ALLOWED = None, ()
 try:
     import specimen_registry as SR
 except Exception:
@@ -282,6 +282,7 @@ class Role:
                           "width": None,
                           "small_values": (self.extras["pos"],
                                            self.extras["small_px"]),
+                          "origin": self.extras.get("origin"),
                           "mmpx": self.extras["mmpx"]}
         else:
             r, self.scans = G.measure(img, c, thickness, lines=True)
@@ -298,6 +299,18 @@ class Role:
         thickness at n stations down the coupon, and the bottom view's length
         gives n end-to-end lengths across its width.
 
+        Positions are measured from the start of the usable scan, so the
+        first station is at 0 and the last is at the far end of what could be
+        measured.
+
+        `trim` is the stations' OWN inset, applied once to the full valid band.
+        Deliberately not the same knob as cfg.edgeTrim, which protects the
+        edge-line fit and so the headline figures and the calibration: lowering
+        this reaches nearer the ends without disturbing any of that. The cost
+        is the outermost chord, which starts reading the rounded, blurred
+        corner instead of the specimen -- with no inset at all a test wedge
+        running 100 to 140 px returned 144 at its last station.
+
         Returns [(position, value), ...] in mm once calibrated and in pixels
         before that, or None when this frame cannot supply the axis.
         """
@@ -310,17 +323,25 @@ class Role:
         try:
             if axis == "width" and sc.get("small_values"):
                 pos, vals = sc["small_values"]
+                origin = sc.get("origin")
                 pr = C.chords_from_values(pos, vals, mmpx, n, band, trim, axis)
             else:
                 s = sc.get(axis)
                 if not s:
                     return None
-                pos, lo, hi = s
+                pos, lo, hi, origin = s
                 pr = C.profile_axis(pos, lo, hi, self.cfg, mmpx, n, band,
                                     trim, axis, order)
         except Exception:
             return None          # a profile is a bonus, never a failed reading
-        return [(round(ch.pos_mm if cal else ch.pos_px, 3),
+        # Positions measured from the SPECIMEN's edge, not from the first
+        # station. Chord.pos_mm is relative to the first chord, so a reading
+        # 8% in would otherwise be labelled 0 and the coupon would look like
+        # it starts wherever measurement happens to start. Chord.pos_px is
+        # already an absolute ROI coordinate, so both cases come from it.
+        o = origin if origin is not None else (float(pos.min()) if len(pos) else 0.0)
+        k = mmpx if cal else 1.0
+        return [(round((ch.pos_px - o) * k, 3),
                  round(ch.span_mm if cal else ch.span_px, 4))
                 for ch in pr.chords]
 
@@ -396,14 +417,6 @@ color:#7d7d7d;padding:8px 0}
 border-bottom:1px solid #2a2a2a}
 .cfgrow label{flex:1;font-size:13px;color:#ccc}
 .cfgrow input,.cfgrow select{width:170px;flex:none}
-.combo{position:relative;display:inline-block}
-.droplist{display:none;position:absolute;z-index:9;left:0;top:calc(100% + 2px);
-min-width:200px;max-height:280px;overflow:auto;background:#242424;
-border:1px solid #3a3a3a;border-radius:6px;box-shadow:0 6px 18px #0009}
-.dropitem{padding:7px 11px;cursor:pointer;font:13px ui-monospace,monospace;
-white-space:nowrap}
-.dropitem:hover{background:#2d7d5a}
-.dropitem.dim{color:#888;cursor:default}
 </style></head><body>
 <div class="wrap">
  <div class="cam"><img src="/stream0"><div class="cap" id="cap0">bottom - length &amp; width</div></div>
@@ -422,11 +435,9 @@ white-space:nowrap}
   <select id="ax"><option value="length">length</option><option value="width">width</option></select>
   <button onclick="cal()">Calibrate</button>
   <div class="lab">Specimen</div>
-  <span class="combo"><input id="sid" placeholder="PS-V4-038" style="width:170px"
-    autocomplete="off" oninput="this.value=this.value.toUpperCase();filtersp()"
-    onfocus="opensp()" onblur="setTimeout(hidesp,180)"
-   ><div id="splist" class="droplist"></div></span>
-  <button onclick="getspecimens()" style="background:#555">Refresh list</button>
+  <input id="sid" placeholder="PS-V4-038" style="width:170px" autocomplete="off"
+   oninput="this.value=this.value.toUpperCase()">
+  <button onclick="checksp()" style="background:#555">Check</button>
   <button onclick="logrow()">Log</button>
   <div class="lab">Region of interest</div>
   <div class="sub">x0,y0,x1,y1 -- pixels, or fractions of the frame when all are
@@ -546,25 +557,15 @@ async function savecfg(){var o={};
  say(await (await fetch('/settings',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})).text());
  loadcfg()}
-var SPEC=[];
-function hidesp(){el('splist').style.display='none'}
-function picksp(c){el('sid').value=c;hidesp()}
-function opensp(){if(!SPEC.length){getspecimens(1)}else{filtersp()}}
-function filtersp(){
- var q=el('sid').value.trim().toUpperCase(),o;
- var m=SPEC.filter(function(c){return c.indexOf(q)>=0});
- if(m.length){o=m.slice(0,60).map(function(c){
-   return '<div class="dropitem" onmousedown="picksp(\''+c+'\')">'+c+'</div>'}).join('')
-   +(m.length>60?'<div class="dropitem dim">'+(m.length-60)+' more - keep typing</div>':'')}
- else{o='<div class="dropitem dim">'+(SPEC.length?'no match':'list not loaded')+'</div>'}
- el('splist').innerHTML=o;el('splist').style.display='block'}
-async function getspecimens(quiet){if(!quiet){say('fetching specimen list...')}
- try{const r=await (await fetch('/specimens')).json();
-  SPEC=r.codes||[];
-  if(r.error){say('list failed: '+r.error)}
-  else if(!quiet){say(SPEC.length+' specimens loaded')}
-  filtersp()}
- catch(e){say('could not reach the app')}}
+// identifier-ingest will not list specimens -- its select requires
+// filter.specimen_id and answers 400 without one. So a code is typed and
+// checked one at a time rather than picked from a list.
+async function checksp(){var c=el('sid')?el('sid').value.trim():'';
+ if(!c){return say('type a specimen code first')}
+ say('checking '+c+'...');
+ say(await (await fetch('/specimen',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({specimen_id:c})})).text())}
 async function logrow(){
  say('logging...');
  say(await (await fetch('/log',{method:'POST',
@@ -623,13 +624,6 @@ text-transform:uppercase;padding:10px 0}
 .cfgrow{display:flex;align-items:center;gap:10px;margin:8px 0}
 .cfgrow label{flex:1;font-size:15px;color:#ccc}
 .cfgrow input,.cfgrow select{width:150px;flex:none;min-height:50px;font-size:20px}
-.combo{position:relative}
-.droplist{display:none;position:absolute;z-index:9;left:0;bottom:calc(100% + 4px);
-width:100%;max-height:44vh;overflow:auto;background:#242424;
-border:1px solid #3a3a3a;border-radius:11px;box-shadow:0 6px 22px #000b}
-.dropitem{padding:15px 14px;font:21px ui-monospace,monospace;
-border-bottom:1px solid #2e2e2e}
-.dropitem.dim{color:#888}
 .stale{color:#8a5a52 !important}
 </style></head><body><div class="pane">
 <div><div class="lab">Length</div><div class="val" id="L">--</div></div>
@@ -646,14 +640,11 @@ border-bottom:1px solid #2e2e2e}
 </div>
 <button onclick="cal()">Calibrate</button>
 <div class="row" style="margin-top:9px">
- <span class="combo" style="flex:1"><input id="sid" placeholder="PS-V4-038"
-   style="width:100%" autocomplete="off"
-   oninput="this.value=this.value.toUpperCase();filtersp()"
-   onfocus="opensp()" onblur="setTimeout(hidesp,250)"
-  ><div id="splist" class="droplist"></div></span>
+ <input id="sid" placeholder="PS-V4-038" style="width:100%" autocomplete="off"
+  oninput="this.value=this.value.toUpperCase()">
 </div>
 <button onclick="logrow()">Log reading</button>
-<button onclick="getspecimens()" style="background:#555">Refresh specimen list</button>
+<button onclick="checksp()" style="background:#555">Check specimen</button>
 <button onclick="post('/profile')">Profile</button>
 <button onclick="if(confirm('Swap cameras? Recalibrate after.'))post('/swap')"
  style="background:#7d5a2d">Swap cameras</button>
@@ -711,25 +702,15 @@ async function savecfg(){var o={};
  say(await (await fetch('/settings',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})).text());
  loadcfg()}
-var SPEC=[];
-function hidesp(){el('splist').style.display='none'}
-function picksp(c){el('sid').value=c;hidesp()}
-function opensp(){if(!SPEC.length){getspecimens(1)}else{filtersp()}}
-function filtersp(){
- var q=el('sid').value.trim().toUpperCase(),o;
- var m=SPEC.filter(function(c){return c.indexOf(q)>=0});
- if(m.length){o=m.slice(0,60).map(function(c){
-   return '<div class="dropitem" onmousedown="picksp(\''+c+'\')">'+c+'</div>'}).join('')
-   +(m.length>60?'<div class="dropitem dim">'+(m.length-60)+' more - keep typing</div>':'')}
- else{o='<div class="dropitem dim">'+(SPEC.length?'no match':'list not loaded')+'</div>'}
- el('splist').innerHTML=o;el('splist').style.display='block'}
-async function getspecimens(quiet){if(!quiet){say('fetching specimen list...')}
- try{const r=await (await fetch('/specimens')).json();
-  SPEC=r.codes||[];
-  if(r.error){say('list failed: '+r.error)}
-  else if(!quiet){say(SPEC.length+' specimens loaded')}
-  filtersp()}
- catch(e){say('could not reach the app')}}
+// identifier-ingest will not list specimens -- its select requires
+// filter.specimen_id and answers 400 without one. So a code is typed and
+// checked one at a time rather than picked from a list.
+async function checksp(){var c=el('sid')?el('sid').value.trim():'';
+ if(!c){return say('type a specimen code first')}
+ say('checking '+c+'...');
+ say(await (await fetch('/specimen',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({specimen_id:c})})).text())}
 async function logrow(){
  say('logging...');
  say(await (await fetch('/log',{method:'POST',
@@ -790,6 +771,10 @@ def main():
     p.add_argument("--max-residual", type=float, default=0.01)
     p.add_argument("--window", type=int, default=20)
     p.add_argument("--chords", type=int, default=20, help="chords per axis")
+    p.add_argument("--station-trim", type=float, default=0.08,
+                   help="fraction of each end the live stations stay clear of. "
+                        "0 puts the outermost station on the very edge, where "
+                        "it reads the rounded corner, not the specimen.")
     p.add_argument("--stations", type=int, default=5,
                    help="evenly spaced points along the coupon reported on "
                         "every reading (length across the width, thickness "
@@ -947,6 +932,11 @@ def main():
           "readings behind the 1s thickness stability figure", rng=(1, 5000)),
         T("chords", "profile chords", "int", "live",
           "chords per axis when you press Profile", rng=(2, 2000)),
+        T("station_trim", "station end inset", "float", "live",
+          "fraction of each end the live stations keep clear of. Lower it to "
+          "reach nearer the edges; the outermost reading then starts picking "
+          "up the rounded corner rather than the specimen. Does not affect the "
+          "headline figures or the calibration", rng=(0, 0.45)),
         T("stations", "live stations", "int", "live",
           "evenly spaced points along the coupon reported on every reading: "
           "length across the width, thickness down the length. 1 = just the "
@@ -955,7 +945,9 @@ def main():
           "mm of specimen averaged into each chord; 0 = a single row",
           rng=(0, 1000)),
         T("trim", "chord end trim", "float", "live",
-          "fraction dropped at each end, where chords clip the corners",
+          "fraction dropped at each end when you press Profile. The live "
+          "stations do NOT use it -- their scan is already trimmed, and "
+          "applying it twice bunched them into the middle of the coupon",
           rng=(0, 0.45)),
         T("order", "centreline order", "int", "live",
           "polynomial order; 1 assumes perfectly straight edges", rng=(1, 8)),
@@ -1042,7 +1034,25 @@ def main():
     # The most recent thickness cam1 produced, independent of whether cam0 is
     # calibrated.
     latest = {"thickness": None}
-    snap = {"json": json.dumps({"rate": 0.0}).encode(), "row": None}
+    snap = {"json": json.dumps({"rate": 0.0}).encode(), "row": None,
+            "prof": None}
+
+    def _profile_doc(d):
+        """The per-station readings, shaped for the app's jsonb `profile` column.
+
+        Built on every reading and written to the CSV regardless. Whether it is
+        SENT is decided by one thing only: whether "profile" appears in
+        identifier_push.ALLOWED, which mirrors what identifier-ingest accepts.
+        Sending a column the function does not know rejects the whole call, so
+        this stays off until Hugo adds it at his end.
+        """
+        doc = {"stations": a.stations}
+        for key, name in (("lenprof", "length_mm"), ("widprof", "width_mm"),
+                          ("thkprof", "thickness_mm")):
+            p = d.get(key)
+            if p:
+                doc[name] = [{"pos": pos, "value": v} for pos, v in p]
+        return doc if len(doc) > 1 else None
 
     # Exactly the columns from Hugo's list of 29 October, mapped from the row's
     # own names. Anything off that list is left out on purpose: the function
@@ -1113,6 +1123,7 @@ def main():
     def publish(d, row=None):
         snap["json"] = json.dumps(d).encode()
         snap["row"] = row
+        snap["prof"] = _profile_doc(d) if row else None
 
     def preview_loop(cam):
         while True:
@@ -1172,7 +1183,7 @@ def main():
                 d["tilt1"], d["rms1"] = float(r1.tilt_deg), float(r1.edge_rms_px)
                 d["skew1"] = side.skew()
                 d["thkprof"] = side.chords("width", a.stations, a.band,
-                                           a.trim, a.order)
+                                           a.station_trim, a.order)
                 d["thickness_mm"] = float(r1.width_px * k1) if k1 else float(r1.width_px)
                 if k1:
                     latest["thickness"] = float(r1.width_px * k1)
@@ -1192,9 +1203,9 @@ def main():
                 d["tilt0"], d["rms0"] = float(r0.tilt_deg), float(r0.edge_rms_px)
                 d["skew0"] = bottom.skew()
                 d["lenprof"] = bottom.chords("length", a.stations, a.band,
-                                             a.trim, a.order)
+                                             a.station_trim, a.order)
                 d["widprof"] = bottom.chords("width", a.stations, a.band,
-                                             a.trim, a.order)
+                                             a.station_trim, a.order)
                 k0 = (c0.mmPerPx(specT)
                       if (bottom.focalPx > 0 and specT is not None) else 0.0)
                 d["length_mm"] = float(r0.length_px * k0) if k0 else float(r0.length_px)
@@ -1263,18 +1274,6 @@ def main():
                 self._send(TOUCH.encode(), "text/html")
             elif self.path == "/state":
                 self._send(snap["json"], "application/json")
-            elif self.path == "/specimens":
-                if SR is None:
-                    body = {"codes": [], "error": "specimen_registry not available"}
-                else:
-                    try:
-                        body = {"codes": SR.list_specimens()}
-                    except Exception as e:
-                        body = {"codes": [], "error": str(e)[:150]}
-                self._send(json.dumps(body).encode(), "application/json")
-            elif self.path == "/settings":
-                self._send(json.dumps(settings_doc()).encode(),
-                           "application/json")
             elif self.path == "/stream0":
                 self._mjpeg(lambda: bottom.cam)     # resolved per frame, so a
             elif self.path == "/stream1":          # swap takes effect live
@@ -1283,6 +1282,29 @@ def main():
                 self.send_error(404)
 
         def do_POST(self):
+            if self.path == "/specimen":
+                nb = int(self.headers.get("Content-Length", 0))
+                try:
+                    code = str(json.loads(self.rfile.read(nb) or b"{}")
+                               .get("specimen_id", "")).strip().upper()
+                except Exception:
+                    code = ""
+                if not code:
+                    return self._send(b"type a specimen code first")
+                if SR is None:
+                    return self._send(b"specimen_registry not available")
+                try:
+                    ok = SR.exists(code)
+                except (Exception, SystemExit) as e:
+                    return self._send(f"could not reach the app: "
+                                      f"{str(e)[:160]}".encode())
+                return self._send(
+                    (f"{code} is in the app - measurements will go up"
+                     if ok else
+                     f"{code} is NOT in specimens - a measurement logged "
+                     f"against it stays in outbox/ until the app knows it")
+                    .encode())
+
             if self.path == "/settings":
                 nbytes = int(self.headers.get("Content-Length", 0))
                 try:
@@ -1559,6 +1581,9 @@ def main():
                             f"tilt {row['tilt0_deg']}/{row['tilt1_deg']} deg")
                     if a.note:
                         note = f"{a.note} | {note}"
+                    extra = app_columns(row)
+                    if "profile" in APP_ALLOWED and snap.get("prof"):
+                        extra["profile"] = snap["prof"]
                     try:
                         f = send_measurement(
                             sid,
@@ -1566,7 +1591,7 @@ def main():
                             width_mm=float(row["width_mm"]),
                             thickness_mm=float(row["thickness_mm"]),
                             notes=note,
-                            **app_columns(row))
+                            **extra)
                         # send_measurement returns the outbox file whether or
                         # not the app took it. The file still being there is
                         # the only honest signal that it did not -- reporting
@@ -1574,9 +1599,17 @@ def main():
                         # every row.
                         if f.exists():
                             waiting = len(list(f.parent.glob("*.json")))
-                            out.append(f"NOT accepted by the app - {waiting} "
-                                       f"waiting in outbox/ (see the terminal "
-                                       f"for the reason)")
+                            why = ""
+                            # One extra call, and only when something went
+                            # wrong: an unknown specimen is much the likeliest
+                            # cause and the terminal is not always in view.
+                            try:
+                                if SR is not None and not SR.exists(sid):
+                                    why = f" - {sid} is not in specimens"
+                            except (Exception, SystemExit):
+                                pass
+                            out.append(f"NOT accepted by the app{why} - "
+                                       f"{waiting} waiting in outbox/")
                         else:
                             out.append("measurement accepted by the app")
                     except Exception as e:

@@ -572,6 +572,12 @@ def _span(arr: np.ndarray, cfg: Config,
             raise RuntimeError(f"only {b - a} {what} cross both end faces - the "
                                f"specimen is too rotated. Square it to the frame.")
         y, lo, hi = y[a:b + 1], lo[a:b + 1], hi[a:b + 1]
+    # The whole valid band, before the ends are trimmed, plus where it starts.
+    # The trim below exists to keep clipped corners out of the LINE FIT, and
+    # that is all it is for. A profile takes its own view: it may want to reach
+    # nearer the ends than the fit dares, at its own risk, so it is handed the
+    # full band and trims it by however much the caller asks for.
+    full = (y, lo, hi, float(y.min()))
     if cfg.edgeTrim > 0 and y.size > 40:
         sp = y.max() - y.min()
         k = (y >= y.min() + cfg.edgeTrim * sp) & (y <= y.max() - cfg.edgeTrim * sp)
@@ -580,7 +586,7 @@ def _span(arr: np.ndarray, cfg: Config,
     la, lb = fit(y, lo), fit(y, hi)
     span = gap(la, lb, float(np.median(y)))
     _check_fit(la, lb, span, what, cfg.maxResidualFrac)
-    return span, la, lb, (y, lo, hi)
+    return span, la, lb, full
 
 
 def _roi(img: np.ndarray, cfg: Config) -> np.ndarray:
@@ -702,6 +708,7 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
     # valid across the whole span, and the contact point we need sits at an
     # untrimmed end.
     span_lo, span_hi = (float(cp.min()), float(cp.max())) if cp.size else (0.0, 0.0)
+    cp_all, cv_all = cp, cv      # untrimmed: the profile trims this as it likes
     if cp.size > 40 and cfg.edgeTrim > 0:
         sp = cp.max() - cp.min()
         k = (cp >= cp.min() + cfg.edgeTrim * sp) & (cp <= cp.max() - cfg.edgeTrim * sp)
@@ -759,13 +766,13 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
     # how fast it lifts; it is zero for a flush specimen, whatever its taper,
     # and then the datum IS the near edge and the profile below is the raw
     # datum-referenced one.
-    off = dline.slope * cp + dline.icept - cv      # datum to free edge, signed
+    off = dline.slope * cp_all + dline.icept - cv_all   # datum to edge, signed
     sgn = float(np.sign(np.median(off))) or 1.0
     drop = dline.slope - yaw_slope
     contact = (span_lo if float(np.sign(drop * (span_hi - span_lo))) == sgn
                else span_hi)
 
-    per_line = np.abs(off - drop * (cp - contact)) * k + offset_px
+    per_line = np.abs(off - drop * (cp_all - contact)) * k + offset_px
     mid = 0.5 * (span_lo + span_hi)
     small_px = abs((dline.slope - cline.slope) * mid + dline.icept - cline.icept
                    - drop * (mid - contact)) * k + offset_px
@@ -785,7 +792,8 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
     rms = np.mean([fa.rms, fb.rms, cline.rms]) if fa else cline.rms
     r = Result(small_px * mmpx, free_px * mmpx, small_px, free_px, mmpx * 1000,
                float(np.degrees(tilt)), float(rms))
-    return r, {"pos": cp, "small_px": per_line, "datum": dline, "edge": cline,
+    return r, {"pos": cp_all, "small_px": per_line, "datum": dline, "edge": cline,
+               "origin": span_lo,
                "skew_deg": skew_deg, "taper_slope": taper_slope,
                "splay_px": splay_px,
                "length_scan": free_scan, "mmpx": mmpx,

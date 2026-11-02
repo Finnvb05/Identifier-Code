@@ -50,6 +50,11 @@ ALLOWED = (
     "focal_px_0", "focal_px_1", "eff_dist_0", "eff_dist_1",
     "skew0_deg", "tilt0_deg", "tilt1_deg", "rms0_px", "rms1_px",
     "roi0", "roi1", "photo_path", "notes",
+    # jsonb: the per-station readings across the coupon. Approved by Hugo on
+    # 2 nov; identifier-ingest accepts it from the same date. This name must
+    # stay in step with the COLUMNS set in supabase/functions/identifier-ingest
+    # -- the function rejects the whole call on a column it does not know.
+    "profile",
 )
 PS_CODE = re.compile(r"^PS-[A-Z0-9]+-\d{3,}$")   # bv. PS-V4-038 (tekstcode, NIET de uuid)
 
