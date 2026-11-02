@@ -555,8 +555,16 @@ def _check_fit(a: Line, b: Line, span: float, what: str,
             f"chord_measure.py on a captured frame to see the edge's actual shape.")
 
 
-def _span(arr: np.ndarray, cfg: Config, what: str) -> tuple[float, Line, Line]:
-    """Two-edge span across every line of arr, with its two fitted edge lines."""
+def _span(arr: np.ndarray, cfg: Config,
+          what: str) -> tuple[float, Line, Line, tuple]:
+    """Two-edge span across every line of arr, with its two fitted edge lines.
+
+    Also hands back the surviving per-line scan (position, low edge, high edge).
+    Those three arrays are what a chord profile is built from, and recovering
+    them here costs nothing -- scanning them again from the same frame is the
+    expensive half of a measurement, and doing it twice would halve the frame
+    rate for data already in hand.
+    """
     y, lo, hi = scan(arr, cfg)
     if cfg.trimCorners:
         a, b = valid_band(y, lo, hi)
@@ -572,7 +580,7 @@ def _span(arr: np.ndarray, cfg: Config, what: str) -> tuple[float, Line, Line]:
     la, lb = fit(y, lo), fit(y, hi)
     span = gap(la, lb, float(np.median(y)))
     _check_fit(la, lb, span, what, cfg.maxResidualFrac)
-    return span, la, lb
+    return span, la, lb, (y, lo, hi)
 
 
 def _roi(img: np.ndarray, cfg: Config) -> np.ndarray:
@@ -583,17 +591,34 @@ def _roi(img: np.ndarray, cfg: Config) -> np.ndarray:
     return img[y0:y1, x0:x1]
 
 
-def measure(img: np.ndarray, cfg: Config, thickness: Optional[float] = None) -> Result:
-    """One frame in, dimensions out."""
+def measure(img: np.ndarray, cfg: Config, thickness: Optional[float] = None,
+            lines: bool = False):
+    """One frame in, dimensions out.
+
+    With lines=True also returns the per-line scans that produced each axis,
+    tagged by the name the axis ended up with, so a caller can build a chord
+    profile without scanning the frame a second time:
+
+        {"length": (pos, lo, hi), "width": (pos, lo, hi), "mmpx": float}
+
+    `pos` runs along the axis PERPENDICULAR to the one being measured, which is
+    what makes the profile meaningful: the width scan of a side view gives
+    thickness along the coupon's length, and the length scan of a bottom view
+    gives length across its width.
+    """
     roi = _roi(img, cfg)
-    w_px, left, right = _span(roi, cfg, "rows")                            # horizontal
-    l_px, _, _ = _span(np.ascontiguousarray(roi.T), cfg, "columns")        # vertical
+    w_px, left, right, w_scan = _span(roi, cfg, "rows")             # horizontal
+    l_px, _, _, l_scan = _span(np.ascontiguousarray(roi.T), cfg, "columns")
     mmpx = cfg.mmPerPx(thickness)
     if cfg.autoOrient and w_px > l_px:
         w_px, l_px = l_px, w_px
-    return Result(w_px * mmpx, l_px * mmpx, w_px, l_px, mmpx * 1000,
-                  float(np.degrees(np.arctan(0.5 * (left.slope + right.slope)))),
-                  0.5 * (left.rms + right.rms))
+        w_scan, l_scan = l_scan, w_scan
+    r = Result(w_px * mmpx, l_px * mmpx, w_px, l_px, mmpx * 1000,
+               float(np.degrees(np.arctan(0.5 * (left.slope + right.slope)))),
+               0.5 * (left.rms + right.rms))
+    if not lines:
+        return r
+    return r, {"length": l_scan, "width": w_scan, "mmpx": mmpx}
 
 
 DATUMS = ("below", "above", "left", "right")
@@ -653,9 +678,9 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
     small_arr, small_ref = (T(roi.T), T(rref.T)) if vertical else (roi, rref)
 
     try:                                          # the free axis is only a cross-check
-        free_px, fa, fb = _span(free_arr, cfg, "free-axis lines")
+        free_px, fa, fb, free_scan = _span(free_arr, cfg, "free-axis lines")
     except RuntimeError:
-        free_px, fa, fb = float("nan"), None, None
+        free_px, fa, fb, free_scan = float("nan"), None, None, None
 
     if cfg.halfwin > 0:
         hw = cfg.halfwin
@@ -683,6 +708,7 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
         cp, cv = cp[k], cv[k]
     if cp.size < 20:
         raise RuntimeError("specimen edge not found clear of the datum")
+    face_slope = None if fa is None else float(0.5 * (fa.slope + fb.slope))
     cline = fit(cp, cv)
     lim = max(3.0, cfg.maxResidualFrac * float(cp.max() - cp.min()))
     if cline.rms > lim:
@@ -690,7 +716,6 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
 
     m = 0.5 * (dline.slope + cline.slope)
     k = 1.0 / np.sqrt(1 + m * m)
-    per_line = np.abs(dline.slope * cp + dline.icept - cv) * k + offset_px
 
     # WHERE to evaluate the datum-to-edge distance.
     #
@@ -713,14 +738,47 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
         return abs((dline.slope - cline.slope) * x
                    + dline.icept - cline.icept) * k
 
-    lo, hi = span_lo, span_hi
-    small_px = min(sep_at(lo), sep_at(hi)) + offset_px
+    # SEPARATING YAW FROM TAPER.
+    #
+    # The datum stands in for the specimen's hidden near edge. Tilt the free
+    # edge away from the datum and there are two possible causes, which look
+    # identical on one edge: the specimen is YAWED (resting on the fixture at
+    # one point, splaying away along its length) or it is TAPERED (flush, but
+    # genuinely wider at one end). Charging the whole tilt to either one is
+    # wrong: blame yaw and a real taper is flattened to nothing; blame taper
+    # and a quarter degree of yaw invents 0.6 mm of taper that is not there.
+    #
+    # The END FACES separate them. They rotate with the specimen but a taper
+    # leaves them alone, so a yawed rectangle has tilted ends and a flush
+    # tapered one has square ends with a sloped free edge. They are fitted in
+    # the transposed frame, hence the sign.
+    yaw_slope = 0.0 if face_slope is None else -face_slope
+
+    # The near edge is the line of that slope which rests on the datum: it
+    # touches at one end of the span and lifts away along the rest. `drop` is
+    # how fast it lifts; it is zero for a flush specimen, whatever its taper,
+    # and then the datum IS the near edge and the profile below is the raw
+    # datum-referenced one.
+    off = dline.slope * cp + dline.icept - cv      # datum to free edge, signed
+    sgn = float(np.sign(np.median(off))) or 1.0
+    drop = dline.slope - yaw_slope
+    contact = (span_lo if float(np.sign(drop * (span_hi - span_lo))) == sgn
+               else span_hi)
+
+    per_line = np.abs(off - drop * (cp - contact)) * k + offset_px
+    mid = 0.5 * (span_lo + span_hi)
+    small_px = abs((dline.slope - cline.slope) * mid + dline.icept - cline.icept
+                   - drop * (mid - contact)) * k + offset_px
 
     # Report the skew so it can never be invisible again. splay_px is what the
     # old midpoint rule would have added; edgeTrim has already pulled the span
     # in, so a little of it survives the correction.
-    skew_deg = float(np.degrees(np.arctan(cline.slope) - np.arctan(dline.slope)))
-    splay_px = float(abs(sep_at(lo) - sep_at(hi)))
+    # Skew is now the YAW alone -- the thing that is a setup fault and that a
+    # warning should fire on. Taper is the specimen's own, and is reported
+    # separately rather than being folded into the same number.
+    skew_deg = float(np.degrees(np.arctan(yaw_slope) - np.arctan(dline.slope)))
+    taper_slope = float(cline.slope - yaw_slope)
+    splay_px = float(abs(drop * (span_hi - span_lo)))
 
     mmpx = cfg.mmPerPx(thickness)
     tilt = np.arctan(0.5 * (fa.slope + fb.slope)) if fa else -np.arctan(m)
@@ -728,7 +786,10 @@ def measure_datum(img: np.ndarray, ref: np.ndarray, cfg: Config,
     r = Result(small_px * mmpx, free_px * mmpx, small_px, free_px, mmpx * 1000,
                float(np.degrees(tilt)), float(rms))
     return r, {"pos": cp, "small_px": per_line, "datum": dline, "edge": cline,
-               "skew_deg": skew_deg, "splay_px": splay_px}
+               "skew_deg": skew_deg, "taper_slope": taper_slope,
+               "splay_px": splay_px,
+               "length_scan": free_scan, "mmpx": mmpx,
+               "face_slope": face_slope}
 
 
 def run(cfg: Config, thickness: Optional[float]) -> None:

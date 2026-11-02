@@ -1,5 +1,10 @@
 """identifier_push.py - stuurt een meting van het identificatiestation naar de PaperSteel-app.
 
+Sinds 2 nov 2026 via de eigen, afgeschermde functie identifier-ingest: die kan
+alleen specimen_id's opzoeken in specimens en rijen toevoegen aan
+identifier_measurements. Niets wijzigen, niets verwijderen, en nooit meer naar
+specimens schrijven.
+
 Startpunt voor Finn (alleen Python-standaardbibliotheek, geen pip install nodig).
 Zelfde route als de Galdabini-trekbank: HTTPS POST naar de 'stark-ingest' edge function.
 
@@ -30,8 +35,22 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CONF = HERE / "stark_ingest.conf"
 OUTBOX = HERE / "outbox"
-TABLE = "identifier_measurements"   # nieuwe tabel - wordt aangemaakt zodra de velden vaststaan
-SOFTWARE_VERSION = "0.1"
+TABLE = "identifier_measurements"
+SOFTWARE_VERSION = "0.2"
+MAX_ROWS = 50                       # identifier-ingest weigert meer per aanroep
+
+# Precies de kolommen uit Hugo's mail van 29 oktober. De functie weigert de HELE
+# aanroep bij een onbekende kolom, dus een enkel veld te veel blokkeert de hele
+# outbox. id en created_at vult de database zelf.
+# Een kolom erbij? Eerst naam + type naar Hugo, niet alvast versturen.
+ALLOWED = (
+    "specimen_id", "measured_at", "station", "software_version",
+    "length_mm", "width_mm", "thickness_mm", "length_side_mm", "delta_mm",
+    "length_px", "width_px", "thickness_px",
+    "focal_px_0", "focal_px_1", "eff_dist_0", "eff_dist_1",
+    "skew0_deg", "tilt0_deg", "tilt1_deg", "rms0_px", "rms1_px",
+    "roi0", "roi1", "photo_path", "notes",
+)
 PS_CODE = re.compile(r"^PS-[A-Z0-9]+-\d{3,}$")   # bv. PS-V4-038 (tekstcode, NIET de uuid)
 
 
@@ -66,9 +85,30 @@ def specimen_exists(conf: dict[str, str], code: str) -> bool:
     return bool(rows)
 
 
+def row_for_app(row: dict) -> dict:
+    """Alleen de kolommen die identifier-ingest accepteert.
+
+    Oude outbox-bestanden kunnen velden bevatten van voor de kolomlijst. Omdat
+    de functie bij een onbekende kolom de hele aanroep weigert, zou een enkel
+    oud bestand de wachtrij voorgoed blokkeren. Hier filteren is dus geen
+    cosmetica maar de reden dat de outbox leegloopt.
+    """
+    return {k: v for k, v in row.items() if k in ALLOWED}
+
+
 def send_measurement(specimen_id: str, *, length_mm: float, width_mm: float, thickness_mm: float,
-                     photo_path: str | None = None, notes: str = "") -> Path:
-    """Schrijf de meting naar outbox/ en probeer meteen alles in de outbox te versturen."""
+                     photo_path: str | None = None, notes: str = "",
+                     **extra) -> Path:
+    """Schrijf de meting naar outbox/ en probeer meteen alles in de outbox te versturen.
+
+    In `extra` mogen alleen namen uit ALLOWED staan (de pixel- en
+    kalibratiekolommen). Een onbekende naam is hier meteen een fout, zodat hij
+    nooit stilletjes in de outbox belandt en daar de hele rij blokkeert.
+    """
+    unknown = sorted(set(extra) - set(ALLOWED))
+    if unknown:
+        raise ValueError(f"kolom(men) niet toegestaan door identifier-ingest: "
+                         f"{', '.join(unknown)} - eerst naam + type naar Hugo")
     if not PS_CODE.match(specimen_id):
         raise ValueError(f"onbekend specimen-ID formaat: {specimen_id!r} (verwacht bv. PS-V4-038)")
     row = {
@@ -78,6 +118,7 @@ def send_measurement(specimen_id: str, *, length_mm: float, width_mm: float, thi
         "measured_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "station": socket.gethostname(), "software_version": SOFTWARE_VERSION,
         "photo_path": photo_path, "notes": notes,
+        **{k: v for k, v in extra.items() if v is not None},
     }
     OUTBOX.mkdir(exist_ok=True)
     f = OUTBOX / f"{row['measured_at'].replace(':', '')}_{specimen_id}.json"
@@ -98,19 +139,36 @@ def flush_outbox() -> int:
     except (OSError, SystemExit) as e:
         print(f"nog niet verstuurd (geen bruikbare {CONF.name}): {e}")
         return 0
-    sent = 0
+    sent, batch = 0, []
+
+    def ship():
+        """Eén aanroep voor maximaal MAX_ROWS metingen; pas daarna wissen."""
+        if not batch:
+            return 0
+        ingest(conf, {"op": "insert", "table": TABLE,
+                      "rows": [r for _, r in batch]})
+        for f, _ in batch:
+            f.unlink()                 # pas weg als de app hem echt heeft
+        n = len(batch)
+        batch.clear()
+        return n
+
     for f in sorted(OUTBOX.glob("*.json")):
-        row = json.loads(f.read_text(encoding="utf-8"))
         try:
+            row = json.loads(f.read_text(encoding="utf-8"))
             if not specimen_exists(conf, row["specimen_id"]):
                 print(f"LET OP: {row['specimen_id']} staat niet in de app - blijft in outbox")
                 continue
-            ingest(conf, {"op": "insert", "table": TABLE, "rows": [row]})
-        except (OSError, RuntimeError) as e:   # geen wifi / app weigert: later opnieuw
+            batch.append((f, row_for_app(row)))
+            if len(batch) >= MAX_ROWS:
+                sent += ship()
+        except (OSError, RuntimeError, ValueError, KeyError) as e:
             print(f"nog niet verstuurd ({f.name}): {e}")
             break
-        f.unlink()
-        sent += 1
+    try:
+        sent += ship()
+    except (OSError, RuntimeError) as e:
+        print(f"laatste portie nog niet verstuurd: {e}")
     return sent
 
 

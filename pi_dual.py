@@ -126,6 +126,7 @@ class Role:
         self.datum = None if datum in (None, "none") else datum
         self.datum_off = 0.0     # px between the reference datum and true contact
         self.extras = None
+        self.scans = None        # per-line edge data from the last measure()
         self.ref_file = ref_file
         self.ref = None          # G.Reference of the EMPTY fixture, or None
         self.touch = 0           # specimen pixels pressed against opaque fixture
@@ -277,10 +278,51 @@ class Role:
                                    f"reference - capture one")
             r, self.extras = G.measure_datum(img, self.ref.ref, c, thickness,
                                              self.datum, self.datum_off)
+            self.scans = {"length": self.extras.get("length_scan"),
+                          "width": None,
+                          "small_values": (self.extras["pos"],
+                                           self.extras["small_px"]),
+                          "mmpx": self.extras["mmpx"]}
         else:
-            r = G.measure(img, c, thickness)
+            r, self.scans = G.measure(img, c, thickness, lines=True)
+            self.scans["small_values"] = None
         k = c.mmPerPx(thickness) if self.focalPx > 0 else 0.0
         return r, c, k
+
+    def chords(self, axis, n, band_mm, trim, order):
+        """`n` evenly spaced chords for one axis of the LAST measurement.
+
+        Free, because measure() already scanned every line of the frame; this
+        only bins what it found. `axis` is "length" or "width", and the chords
+        run along the PERPENDICULAR axis -- so the side view's width gives
+        thickness at n stations down the coupon, and the bottom view's length
+        gives n end-to-end lengths across its width.
+
+        Returns [(position, value), ...] in mm once calibrated and in pixels
+        before that, or None when this frame cannot supply the axis.
+        """
+        sc = self.scans
+        if not sc or n < 1:
+            return None
+        cal = self.focalPx > 0
+        mmpx = (sc.get("mmpx") or 0.0) if cal else 0.0
+        band = band_mm if cal else 0.0
+        try:
+            if axis == "width" and sc.get("small_values"):
+                pos, vals = sc["small_values"]
+                pr = C.chords_from_values(pos, vals, mmpx, n, band, trim, axis)
+            else:
+                s = sc.get(axis)
+                if not s:
+                    return None
+                pos, lo, hi = s
+                pr = C.profile_axis(pos, lo, hi, self.cfg, mmpx, n, band,
+                                    trim, axis, order)
+        except Exception:
+            return None          # a profile is a bonus, never a failed reading
+        return [(round(ch.pos_mm if cal else ch.pos_px, 3),
+                 round(ch.span_mm if cal else ch.span_px, 4))
+                for ch in pr.chords]
 
     def skew(self):
         """Degrees between the fixture's datum line and the specimen's edge.
@@ -380,8 +422,6 @@ white-space:nowrap}
   <select id="ax"><option value="length">length</option><option value="width">width</option></select>
   <button onclick="cal()">Calibrate</button>
   <div class="lab">Specimen</div>
-  <select id="smode" onchange="smode()">
-   <option value="existing">existing</option><option value="new">new</option></select>
   <span class="combo"><input id="sid" placeholder="PS-V4-038" style="width:170px"
     autocomplete="off" oninput="this.value=this.value.toUpperCase();filtersp()"
     onfocus="opensp()" onblur="setTimeout(hidesp,180)"
@@ -419,6 +459,13 @@ white-space:nowrap}
 function el(i){return document.getElementById(i)}
 function say(t){var v=String(t||'');el('msg').textContent=v.length>600?v.slice(0,600):v}
 function row(k,v,c){return '<tr><td>'+k+'</td><td class="'+(c||'')+'">'+v+'</td></tr>'}
+function prof(p,cal){
+ if(!p||!p.length){return '--'}
+ var v=p.map(function(x){return x[1]});
+ var mn=Math.min.apply(null,v),mx=Math.max.apply(null,v);
+ return v.map(function(x){return x.toFixed(cal?3:1)}).join('&nbsp; ')+
+  '<span style="color:#7d7d7d"> &nbsp;spread '+
+  (cal?((mx-mn)*1000).toFixed(0)+' um':(mx-mn).toFixed(2)+' px')+'</span>'}
 function fmt(id,v,u,cal){el(id).innerHTML=(v===null||v===undefined)?'--':
  v.toFixed(cal?3:1)+'<small>'+u+'</small>'}
 async function poll(){
@@ -436,6 +483,12 @@ async function poll(){
    row('side status',s.err1||'ok',s.err1?'bad':'ok')+
    row('bottom edge RMS',s.rms0===null?'--':s.rms0.toFixed(3)+' px')+
    row('side edge RMS',s.rms1===null?'--':s.rms1.toFixed(3)+' px')+
+   (s.lenprof?row('length &times; '+s.lenprof.length+
+     ' <span class="sub">across the width</span>',prof(s.lenprof,s.cal0)):'')+
+   (s.widprof?row('width &times; '+s.widprof.length+
+     ' <span class="sub">down the length</span>',prof(s.widprof,s.cal0)):'')+
+   (s.thkprof?row('thickness &times; '+s.thkprof.length+
+     ' <span class="sub">down the length</span>',prof(s.thkprof,s.cal1)):'')+
    row('bottom tilt',s.tilt0===null?'--':s.tilt0.toFixed(2)+' deg')+
    (s.skew0===null||s.skew0===undefined?'':
     row('bottom datum skew',s.skew0.toFixed(3)+' deg',
@@ -494,14 +547,10 @@ async function savecfg(){var o={};
   headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})).text());
  loadcfg()}
 var SPEC=[];
-function smode(){var n=el('smode').value==='new';
- el('sid').placeholder=n?'PS-V4   (series)':'PS-V4-038';
- hidesp()}
 function hidesp(){el('splist').style.display='none'}
 function picksp(c){el('sid').value=c;hidesp()}
 function opensp(){if(!SPEC.length){getspecimens(1)}else{filtersp()}}
 function filtersp(){
- if(el('smode').value!=='existing'){return hidesp()}
  var q=el('sid').value.trim().toUpperCase(),o;
  var m=SPEC.filter(function(c){return c.indexOf(q)>=0});
  if(m.length){o=m.slice(0,60).map(function(c){
@@ -520,8 +569,8 @@ async function logrow(){
  say('logging...');
  say(await (await fetch('/log',{method:'POST',
   headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({mode:el('smode').value,
-   specimen_id:el('sid')?el('sid').value.trim():''})})).text())}
+  body:JSON.stringify({specimen_id:el('sid')?el('sid').value.trim():''})
+  })).text())}
 // Side view: label the small axis 'thickness' (value stays 'width').
 function axes(){var side=el('cam').value==='1';
  el('ax').options[1].text=side?'thickness':'width'}
@@ -597,8 +646,6 @@ border-bottom:1px solid #2e2e2e}
 </div>
 <button onclick="cal()">Calibrate</button>
 <div class="row" style="margin-top:9px">
- <select id="smode" onchange="smode()" style="flex:0 0 38%">
-  <option value="existing">existing</option><option value="new">new</option></select>
  <span class="combo" style="flex:1"><input id="sid" placeholder="PS-V4-038"
    style="width:100%" autocomplete="off"
    oninput="this.value=this.value.toUpperCase();filtersp()"
@@ -665,14 +712,10 @@ async function savecfg(){var o={};
   headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})).text());
  loadcfg()}
 var SPEC=[];
-function smode(){var n=el('smode').value==='new';
- el('sid').placeholder=n?'PS-V4   (series)':'PS-V4-038';
- hidesp()}
 function hidesp(){el('splist').style.display='none'}
 function picksp(c){el('sid').value=c;hidesp()}
 function opensp(){if(!SPEC.length){getspecimens(1)}else{filtersp()}}
 function filtersp(){
- if(el('smode').value!=='existing'){return hidesp()}
  var q=el('sid').value.trim().toUpperCase(),o;
  var m=SPEC.filter(function(c){return c.indexOf(q)>=0});
  if(m.length){o=m.slice(0,60).map(function(c){
@@ -691,8 +734,8 @@ async function logrow(){
  say('logging...');
  say(await (await fetch('/log',{method:'POST',
   headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({mode:el('smode').value,
-   specimen_id:el('sid')?el('sid').value.trim():''})})).text())}
+  body:JSON.stringify({specimen_id:el('sid')?el('sid').value.trim():''})
+  })).text())}
 // Side view: label the small axis 'thickness' (value stays 'width').
 function axes(){var side=el('cam').value==='1';
  el('ax').options[1].text=side?'thickness':'width'}
@@ -709,34 +752,10 @@ poll();
 
 LOG_COLS = ["when", "specimen_id", "length_mm", "width_mm", "thickness_mm", "length_side_mm",
             "delta_mm", "length_px", "width_px", "thickness_px", "length_side_px",
+            "length_pos_mm", "length_profile_mm",
+            "width_pos_mm", "width_profile_mm", "thickness_pos_mm", "thickness_profile_mm",
             "skew0_deg", "skew1_deg", "tilt0_deg", "tilt1_deg", "rms0_px", "rms1_px",
             "focalPx0", "effDist0", "focalPx1", "effDist1", "roi0", "roi1", "note"]
-
-
-def parse_fields(spec):
-    """'species=beech, batch=B12, density=720' -> a dict for the insert.
-
-    Values go through json.loads first, so 720 arrives as a number and true as
-    a boolean; anything that is not valid JSON stays the text you typed. That
-    matters because a numeric column refuses the string "720" on some setups
-    and accepts the number on all of them.
-    """
-    out = {}
-    for part in (spec or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "=" not in part:
-            raise ValueError(f"{part!r} is not key=value")
-        k, v = part.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if not k:
-            raise ValueError(f"{part!r} has no column name")
-        try:
-            out[k] = json.loads(v)
-        except Exception:
-            out[k] = v
-    return out
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -771,6 +790,10 @@ def main():
     p.add_argument("--max-residual", type=float, default=0.01)
     p.add_argument("--window", type=int, default=20)
     p.add_argument("--chords", type=int, default=20, help="chords per axis")
+    p.add_argument("--stations", type=int, default=5,
+                   help="evenly spaced points along the coupon reported on "
+                        "every reading (length across the width, thickness "
+                        "down the length)")
     p.add_argument("--band", type=float, default=3.0,
                    help="mm of specimen averaged into each chord; 0 = single row")
     p.add_argument("--trim", type=float, default=0.05,
@@ -784,11 +807,6 @@ def main():
                         "measurements.csv beside this script; pass --log '' to "
                         "turn the CSV off")
     p.add_argument("--note", default="")
-    p.add_argument("--new-fields", default="",
-                   help="extra columns written into `specimens` when the Pi "
-                        "mints a new ID, as key=value pairs: "
-                        "--new-fields 'species=beech, batch=B12'. Needed for "
-                        "every NOT NULL column the table has besides the code.")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--calib0", default=here("calib_bottom.json"))
     p.add_argument("--calib1", default=here("calib_side.json"))
@@ -929,6 +947,10 @@ def main():
           "readings behind the 1s thickness stability figure", rng=(1, 5000)),
         T("chords", "profile chords", "int", "live",
           "chords per axis when you press Profile", rng=(2, 2000)),
+        T("stations", "live stations", "int", "live",
+          "evenly spaced points along the coupon reported on every reading: "
+          "length across the width, thickness down the length. 1 = just the "
+          "headline figure", rng=(1, 60)),
         T("band", "chord band", "float", "live",
           "mm of specimen averaged into each chord; 0 = a single row",
           rng=(0, 1000)),
@@ -942,10 +964,6 @@ def main():
           "every later measurement, so more is better", rng=(1, 200)),
         T("note", "note on every row", "text", "live",
           "free text written into the CSV and pushed with each measurement"),
-        T("new_fields", "new specimen fields", "text", "live",
-          "key=value pairs written into the specimens table when you mint a "
-          "new ID, e.g. species=beech, batch=B12. Every NOT NULL column that "
-          "table has besides the code must appear here", blank=True),
         T("log", "measurement CSV", "text", "live",
           "appended to on every Log. Blank turns the CSV off", blank=True),
         T("profile_csv", "profile CSV", "text", "live",
@@ -1026,6 +1044,36 @@ def main():
     latest = {"thickness": None}
     snap = {"json": json.dumps({"rate": 0.0}).encode(), "row": None}
 
+    # Exactly the columns from Hugo's list of 29 October, mapped from the row's
+    # own names. Anything off that list is left out on purpose: the function
+    # rejects the WHOLE call on an unknown column, so one stray field would
+    # block the entire queue. skew1_deg, length_side_px and the per-station
+    # profile are measured and written to the CSV, but not sent.
+    APP_COLS = {"length_side_mm": "length_side_mm", "delta_mm": "delta_mm",
+                "length_px": "length_px", "width_px": "width_px",
+                "thickness_px": "thickness_px",
+                "focalPx0": "focal_px_0", "focalPx1": "focal_px_1",
+                "effDist0": "eff_dist_0", "effDist1": "eff_dist_1",
+                "skew0_deg": "skew0_deg", "tilt0_deg": "tilt0_deg",
+                "tilt1_deg": "tilt1_deg",
+                "rms0_px": "rms0_px", "rms1_px": "rms1_px"}
+
+    def app_columns(row):
+        out = {}
+        for src, dst in APP_COLS.items():
+            try:
+                out[dst] = float(row[src])
+            except (KeyError, TypeError, ValueError):
+                pass                    # blank in the row: leave the column out
+        for k in ("roi0", "roi1"):
+            if row.get(k):
+                out[k] = row[k]
+        return out
+
+    def _prof(p, i):
+        """One column of a profile, pipe-separated as roi0/roi1 already are."""
+        return "" if not p else "|".join(f"{v[i]:.4f}" for v in p)
+
     def _row(r0, r1, c0, c1, specT, side_len, d):
         return {
             "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1039,6 +1087,12 @@ def main():
             "thickness_px": f"{r1.width_px:.4f}",
             "length_side_px": (f"{r1.length_px:.4f}"
                                if np.isfinite(r1.length_px) else ""),
+            "length_pos_mm": _prof(d.get("lenprof"), 0),
+            "length_profile_mm": _prof(d.get("lenprof"), 1),
+            "width_pos_mm": _prof(d.get("widprof"), 0),
+            "width_profile_mm": _prof(d.get("widprof"), 1),
+            "thickness_pos_mm": _prof(d.get("thkprof"), 0),
+            "thickness_profile_mm": _prof(d.get("thkprof"), 1),
             "skew0_deg": ("" if d.get("skew0") is None
                           else f"{d['skew0']:+.4f}"),
             "skew1_deg": ("" if d.get("skew1") is None
@@ -1103,6 +1157,7 @@ def main():
                  "delta_mm": None, "tilt0": None, "tilt1": None,
                  "rms0": None, "rms1": None, "tsd": None, "n": len(hist),
                  "skew0": None, "skew1": None,
+                 "lenprof": None, "widprof": None, "thkprof": None,
                  "roi0": list(bottom.last_roi) if bottom.last_roi else None,
                  "roi1": list(side.last_roi) if side.last_roi else None}
             row = None
@@ -1116,6 +1171,8 @@ def main():
                 r1, c1, k1 = side.measure(img1, 0.0)
                 d["tilt1"], d["rms1"] = float(r1.tilt_deg), float(r1.edge_rms_px)
                 d["skew1"] = side.skew()
+                d["thkprof"] = side.chords("width", a.stations, a.band,
+                                           a.trim, a.order)
                 d["thickness_mm"] = float(r1.width_px * k1) if k1 else float(r1.width_px)
                 if k1:
                     latest["thickness"] = float(r1.width_px * k1)
@@ -1134,6 +1191,10 @@ def main():
                 r0, c0, _ = bottom.measure(img0, 0.0)
                 d["tilt0"], d["rms0"] = float(r0.tilt_deg), float(r0.edge_rms_px)
                 d["skew0"] = bottom.skew()
+                d["lenprof"] = bottom.chords("length", a.stations, a.band,
+                                             a.trim, a.order)
+                d["widprof"] = bottom.chords("width", a.stations, a.band,
+                                             a.trim, a.order)
                 k0 = (c0.mmPerPx(specT)
                       if (bottom.focalPx > 0 and specT is not None) else 0.0)
                 d["length_mm"] = float(r0.length_px * k0) if k0 else float(r0.length_px)
@@ -1240,8 +1301,6 @@ def main():
                     else:
                         try:
                             wanted[k] = coerce(t, raw)
-                            if k == "new_fields":
-                                parse_fields(wanted[k])   # fail here, not at Log
                         except ValueError as e:
                             bad.append(f"{t['label']}: {e}")
                 if bad:
@@ -1460,7 +1519,6 @@ def main():
                 except Exception:
                     req = {}
                 sid = str(req.get("specimen_id", "")).strip().upper()
-                mode = str(req.get("mode", "existing")).strip().lower()
 
                 row = snap["row"]
                 if not row:
@@ -1469,44 +1527,11 @@ def main():
                     return self._send(b"no complete measurement to log - both "
                                       b"views must be calibrated")
 
+                # The station no longer creates specimens. identifier-ingest can
+                # only select from `specimens`, and a measurement for a code the
+                # app does not know stays in outbox/ by design -- that is the
+                # app's check, not a fault here.
                 out = []
-                if mode == "new":
-                    # Mint the code BEFORE writing the CSV, or the local row gets
-                    # the series prefix ("PS-V4") as its ID and never matches the
-                    # specimen that ends up in the app.
-                    #
-                    # The database's uniqueness on specimen_id is the arbiter, not
-                    # our copy of the list -- the press or another station can take
-                    # a number a second before we do. So: propose, insert, and on
-                    # rejection try the next one. A consequence worth knowing: a
-                    # NEW specimen cannot be created offline. The reading is still
-                    # written to the CSV below, so nothing is lost -- you just have
-                    # to attach it to a code later.
-                    if SR is None:
-                        out.append("specimen_registry not available - no new ID")
-                        sid = ""
-                    else:
-                        try:
-                            # The dashboard reads the dimensions off the
-                            # specimens row itself, so put them in the insert
-                            # that creates it. Doing it now, while we are
-                            # already writing the row, avoids ever having to
-                            # UPDATE a specimen -- the history in
-                            # identifier_measurements stays append-only and
-                            # nothing is overwritten. Anything typed into
-                            # "new specimen fields" wins, so a bad reading can
-                            # still be overridden by hand.
-                            born = {"length_mm": round(float(row["length_mm"]), 2),
-                                    "width_mm": round(float(row["width_mm"]), 2),
-                                    "thickness_mm": round(float(row["thickness_mm"]), 3)}
-                            born.update(parse_fields(a.new_fields))
-                            sid = SR.claim_next(sid or "PS-V4", **born)
-                            out.append(f"created {sid} with "
-                                       + ", ".join(sorted(born)))
-                        except Exception as e:
-                            out.append(f"could not create a specimen "
-                                       f"({str(e)[:220]}) - logged WITHOUT an ID")
-                            sid = ""
                 row = dict(row, specimen_id=sid)
 
                 if a.log:
@@ -1540,7 +1565,8 @@ def main():
                             length_mm=float(row["length_mm"]),
                             width_mm=float(row["width_mm"]),
                             thickness_mm=float(row["thickness_mm"]),
-                            notes=note)
+                            notes=note,
+                            **app_columns(row))
                         # send_measurement returns the outbox file whether or
                         # not the app took it. The file still being there is
                         # the only honest signal that it did not -- reporting
