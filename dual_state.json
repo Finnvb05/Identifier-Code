@@ -18,6 +18,7 @@
   "note": "-",
   "profile_csv": "",
   "new_fields": "species=TEST, grain=TEST",
-  "datum0": "below"
+  "datum0": "below",
+  "touch_keypad": "on"
  }
 }

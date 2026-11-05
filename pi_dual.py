@@ -12,6 +12,7 @@ import http.server
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -448,6 +449,7 @@ border-bottom:1px solid #2a2a2a}
   <div class="lab">Empty-fixture reference</div>
   <div class="sub">Remove the coupon, then capture. Divides out the fixture and the
    backlight's unevenness. Uses the view selected above.</div>
+  <button id="blb" onclick="bl()" style="background:#555">Backlights</button>
   <button onclick="ref('capture')">Capture reference</button>
   <button onclick="ref('clear')" style="background:#555">Clear reference</button>
   <button onclick="post('/profile')">Profile</button>
@@ -487,6 +489,7 @@ async function poll(){
   if(s.delta_mm===null||s.delta_mm===undefined){el('D').innerHTML='--'}
   else{el('D').innerHTML=(s.delta_mm>=0?'+':'')+s.delta_mm.toFixed(3)+
    '<small>mm</small>';el('D').style.color=Math.abs(s.delta_mm)<0.1?'#8fd9b0':'#e8a33d'}
+  blshow(s.backlight);
   el('cap0').textContent='bottom (sensor '+s.sensor0+') - length & width';
   el('cap1').textContent='side (sensor '+s.sensor1+') - thickness & length check';
   el('q').innerHTML=
@@ -566,6 +569,14 @@ async function checksp(){var c=el('sid')?el('sid').value.trim():'';
  say(await (await fetch('/specimen',{method:'POST',
   headers:{'Content-Type':'application/json'},
   body:JSON.stringify({specimen_id:c})})).text())}
+async function bl(){say('switching the backlights...');
+ say(await (await fetch('/backlight',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({toggle:true})})).text())}
+function blshow(v){var b=el('blb');if(!b){return}
+ var on=(v===true),known=(v===true||v===false);
+ b.textContent='Backlights '+(known?(on?'ON':'OFF'):'?');
+ b.style.background=on?'#2d7d5a':(known?'#555':'#7d5a2d')}
 async function logrow(){
  say('logging...');
  say(await (await fetch('/log',{method:'POST',
@@ -615,6 +626,25 @@ border:1px solid #3a3a3a;border-radius:11px;padding:0 12px;text-align:center}
 button{width:100%;min-height:76px;font:600 26px system-ui;border:0;border-radius:11px;
 background:#2d7d5a;color:#fff;margin-top:9px}
 button:active{background:#256b4c}
+/* Docked to the bottom like a phone keyboard, not covering the screen. The
+   readings stay visible above it; what you are typing is echoed in the strip
+   at the top of the keypad, so the field itself does not need to be in view. */
+.kb{display:none;position:fixed;left:0;right:0;bottom:0;z-index:50;
+height:34vh;max-height:380px;background:#141414;border-top:1px solid #383838;
+box-shadow:0 -10px 26px #000a;padding:7px 7px 9px;
+flex-direction:column;gap:5px}
+.kb.on{display:flex}
+.kbhead{display:flex;align-items:baseline;gap:10px;padding:0 3px 4px;
+border-bottom:1px solid #2d7d5a}
+.kbtop{font-size:11px;letter-spacing:.1em;color:#7d7d7d;text-transform:uppercase;
+white-space:nowrap}
+.kbval{font:700 22px ui-monospace,monospace;color:#7fd8a8;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;text-align:right}
+.kbrow{display:flex;gap:5px;flex:1;min-height:0}
+.kbrow button{flex:1;min-height:0;margin:0;padding:0;font:600 19px system-ui;
+background:#2a2a2a;border-radius:7px}
+.kbrow button.act{background:#2d7d5a}
+.kbrow button.warn{background:#7d5a2d}
 #msg{min-height:38px;font-size:15px;color:#8fbf9f;overflow:auto;max-height:22vh;white-space:pre-wrap;word-break:break-word}
 .sub{font-size:13px;color:#777}
 details{margin-top:9px;border:1px solid #333;border-radius:11px;padding:4px 12px 10px;
@@ -633,18 +663,19 @@ text-transform:uppercase;padding:10px 0}
 <div class="spacer"></div>
 <div id="msg"></div>
 <div class="row">
- <input id="km" type="number" step="0.001" placeholder="known mm">
+ <input id="km" data-kb="known mm" inputmode="decimal" placeholder="known mm">
  <select id="cam" onchange="axes()"><option value="0">bottom</option>
   <option value="1">side</option></select>
  <select id="ax"><option value="length">length</option><option value="width">width</option></select>
 </div>
 <button onclick="cal()">Calibrate</button>
 <div class="row" style="margin-top:9px">
- <input id="sid" placeholder="PS-V4-038" style="width:100%" autocomplete="off"
-  oninput="this.value=this.value.toUpperCase()">
+ <input id="sid" data-kb="specimen" placeholder="PS-V4-038" style="width:100%"
+  autocomplete="off" oninput="this.value=this.value.toUpperCase()">
 </div>
 <button onclick="logrow()">Log reading</button>
 <button onclick="checksp()" style="background:#555">Check specimen</button>
+<button id="blb" onclick="bl()" style="background:#555">Backlights</button>
 <button onclick="post('/profile')">Profile</button>
 <button onclick="if(confirm('Swap cameras? Recalibrate after.'))post('/swap')"
  style="background:#7d5a2d">Swap cameras</button>
@@ -655,14 +686,69 @@ text-transform:uppercase;padding:10px 0}
  <button onclick="savecfg()">Apply &amp; save</button>
  <button onclick="loadcfg()" style="background:#555">Revert</button>
 </details>
+<div id="kb" class="kb">
+ <div class="kbhead"><span class="kbtop" id="kbl"></span
+  ><span class="kbval" id="kbv"></span></div>
+ <div id="kbkeys" style="display:flex;flex-direction:column;gap:5px;flex:1;
+  min-height:0"></div>
+</div>
 </div><script>
 function el(i){return document.getElementById(i)}
 function say(t){var v=String(t||'');el('msg').textContent=v.length>400?v.slice(0,400):v}
+
+// ON-SCREEN KEYPAD.
+// The Pi has no system keyboard installed, and installing one would make the
+// station depend on the compositor, the session type and whether Chromium is
+// running through XWayland -- none of which has anything to do with measuring
+// coupons. This one is part of the page, so an OS update cannot break it, and
+// it covers the screen rather than sliding over the readings.
+var KBT = null, KBO = "";
+var KBROWS = [["1","2","3","4","5","6","7","8","9","0"],
+              ["Q","W","E","R","T","Y","U","I","O","P"],
+              ["A","S","D","F","G","H","J","K","L","-"],
+              ["Z","X","C","V","B","N","M",".",",","\u232B"]];
+function kbinit(){var h="";
+ KBROWS.forEach(function(r){h+='<div class="kbrow">'+r.map(function(k){
+  return '<button onclick="kbkey(\''+k+'\')">'+k+'</button>'}).join("")+'</div>'});
+ h+='<div class="kbrow"><button class="warn" onclick="kbclear()">Clear</button>'+
+    '<button onclick="kbclose(0)">Cancel</button>'+
+    '<button class="act" onclick="kbclose(1)">Done</button></div>';
+ el('kbkeys').innerHTML=h}
+function kbshow(){el('kbv').textContent=KBT?(KBT.value||" "):""}
+function kbopen(t){KBT=t;KBO=t.value;
+ el('kbl').textContent=t.getAttribute('data-kb')||
+  t.getAttribute('placeholder')||t.id||'value';
+ kbshow();el('kb').classList.add('on')}
+function kbkey(k){if(!KBT){return}
+ KBT.value=(k==="\u232B")?KBT.value.slice(0,-1):KBT.value+k;
+ KBT.dispatchEvent(new Event('input',{bubbles:true}));kbshow()}
+function kbclear(){if(!KBT){return}KBT.value="";
+ KBT.dispatchEvent(new Event('input',{bubbles:true}));kbshow()}
+function kbclose(keep){
+ if(KBT&&!keep){KBT.value=KBO;
+  KBT.dispatchEvent(new Event('input',{bubbles:true}))}
+ if(KBT){KBT.dispatchEvent(new Event('change',{bubbles:true}))}
+ el('kb').classList.remove('on');KBT=null}
+// Delegated, so the Settings fields -- built after load -- get it too without
+// every one of them having to remember to ask.
+// Off unless the station says otherwise: blurring the field is what lets the
+// keypad have the screen to itself, and it is also exactly what stops
+// squeekboard from coming up. Only one of the two can win, so the station
+// decides which.
+var KBON=false;
+document.addEventListener('click',function(e){
+ if(!KBON){return}
+ var t=e.target;
+ if(t&&t.tagName==='INPUT'&&t.type!=='button'&&!t.closest('#kb')){
+  t.blur();kbopen(t)}});
+kbinit();
 function fmt(id,v,u,cal){var e=el(id);
  if(v===null||v===undefined){e.innerHTML='--';e.classList.add('stale')}
  else{e.innerHTML=v.toFixed(cal?2:1)+'<small>'+u+'</small>';e.classList.remove('stale')}}
 async function poll(){
  try{const s=await (await fetch('/state')).json();
+  KBON=!!s.keypad;
+  blshow(s.backlight);
   fmt('L',s.length_mm,s.cal0?'mm':'px',s.cal0);
   fmt('W',s.width_mm,s.cal0?'mm':'px',s.cal0);
   fmt('T',s.thickness_mm,s.cal1?'mm':'px',s.cal1);
@@ -711,6 +797,14 @@ async function checksp(){var c=el('sid')?el('sid').value.trim():'';
  say(await (await fetch('/specimen',{method:'POST',
   headers:{'Content-Type':'application/json'},
   body:JSON.stringify({specimen_id:c})})).text())}
+async function bl(){say('switching the backlights...');
+ say(await (await fetch('/backlight',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({toggle:true})})).text())}
+function blshow(v){var b=el('blb');if(!b){return}
+ var on=(v===true),known=(v===true||v===false);
+ b.textContent='Backlights '+(known?(on?'ON':'OFF'):'?');
+ b.style.background=on?'#2d7d5a':(known?'#555':'#7d5a2d')}
 async function logrow(){
  say('logging...');
  say(await (await fetch('/log',{method:'POST',
@@ -771,6 +865,16 @@ def main():
     p.add_argument("--max-residual", type=float, default=0.01)
     p.add_argument("--window", type=int, default=20)
     p.add_argument("--chords", type=int, default=20, help="chords per axis")
+    p.add_argument("--backlight-gpio", type=int, default=17,
+                   help="GPIO driving the backlight relay (BCM numbering)")
+    p.add_argument("--backlight-active", default="low", choices=("low", "high"),
+                   help="which level switches the relay ON. The common blue "
+                        "SONGLE boards are active LOW.")
+    p.add_argument("--touch-keypad", default="off", choices=("off", "on"),
+                   help="draw an on-screen keypad into the touchscreen page. "
+                        "Off by default: the Pi's own squeekboard should do "
+                        "this job, and two keyboards fight each other. Turn it "
+                        "on only if the system one will not come up.")
     p.add_argument("--station-trim", type=float, default=0.08,
                    help="fraction of each end the live stations stay clear of. "
                         "0 puts the outermost station on the very edge, where "
@@ -937,6 +1041,16 @@ def main():
           "reach nearer the edges; the outermost reading then starts picking "
           "up the rounded corner rather than the specimen. Does not affect the "
           "headline figures or the calibration", rng=(0, 0.45)),
+        T("backlight_gpio", "backlight GPIO", "int", "live",
+          "BCM pin driving the backlight relay", rng=(0, 53)),
+        T("backlight_active", "backlight relay is on when", "choice", "live",
+          "which level energises the relay. Blue SONGLE boards are active low",
+          choices=("low", "high")),
+        T("touch_keypad", "touchscreen keypad", "choice", "live",
+          "an on-screen keypad drawn into the touchscreen page. Leave off "
+          "while the Pi's own squeekboard works -- enabling this blurs the "
+          "field on tap, which stops the system keyboard appearing",
+          choices=("off", "on")),
         T("stations", "live stations", "int", "live",
           "evenly spaced points along the coupon reported on every reading: "
           "length across the width, thickness down the length. 1 = just the "
@@ -1036,6 +1150,42 @@ def main():
     latest = {"thickness": None}
     snap = {"json": json.dumps({"rate": 0.0}).encode(), "row": None,
             "prof": None}
+
+    # ------------------------------------------------------------ lights --
+    # Shelling out to pinctrl rather than taking a GPIO library as a
+    # dependency: it is preinstalled on Pi OS, it is what actually works on a
+    # Pi 5, and the station already has enough moving parts.
+    _bl = {"on": None, "t": 0.0}
+
+    def backlight_read(force=False):
+        """True / False, or None when the pin is not driven or pinctrl fails.
+
+        Cached: the measure loop asks on every frame and spawning a process
+        0.6 times a second to read one pin is not a good trade.
+        """
+        now = time.time()
+        if not force and now - _bl["t"] < 3.0:
+            return _bl["on"]
+        _bl["t"] = now
+        try:
+            out = subprocess.run(["pinctrl", "get", str(a.backlight_gpio)],
+                                 capture_output=True, text=True,
+                                 timeout=3).stdout
+        except Exception:
+            _bl["on"] = None
+            return None
+        if " op " not in out:          # still an input: nothing has driven it
+            _bl["on"] = None
+        else:
+            high = " dh " in out
+            _bl["on"] = high if a.backlight_active == "high" else not high
+        return _bl["on"]
+
+    def backlight_set(on):
+        level = "dh" if (on == (a.backlight_active == "high")) else "dl"
+        subprocess.run(["pinctrl", "set", str(a.backlight_gpio), "op", level],
+                       capture_output=True, text=True, timeout=3, check=True)
+        _bl["on"], _bl["t"] = bool(on), time.time()
 
     def _profile_doc(d):
         """The per-station readings, shaped for the app's jsonb `profile` column.
@@ -1159,7 +1309,8 @@ def main():
             t0 = time.time()
             d = {"rate": 0.0, "err0": None, "err1": None,
                  "cal0": bottom.focalPx > 0, "cal1": side.focalPx > 0,
-                 "swapped": swapped["v"],
+                 "swapped": swapped["v"], "keypad": a.touch_keypad == "on",
+                 "backlight": backlight_read(),
                  "ref0": bottom.ref is not None, "ref1": side.ref is not None,
                  "datum0": bottom.datum, "datum1": side.datum,
                  "doff0": bottom.datum_off, "doff1": side.datum_off,
@@ -1274,6 +1425,9 @@ def main():
                 self._send(TOUCH.encode(), "text/html")
             elif self.path == "/state":
                 self._send(snap["json"], "application/json")
+            elif self.path == "/settings":
+                self._send(json.dumps(settings_doc()).encode(),
+                           "application/json")
             elif self.path == "/stream0":
                 self._mjpeg(lambda: bottom.cam)     # resolved per frame, so a
             elif self.path == "/stream1":          # swap takes effect live
@@ -1282,6 +1436,27 @@ def main():
                 self.send_error(404)
 
         def do_POST(self):
+            if self.path == "/backlight":
+                nb = int(self.headers.get("Content-Length", 0))
+                try:
+                    req = json.loads(self.rfile.read(nb) or b"{}")
+                except Exception:
+                    req = {}
+                cur = backlight_read(force=True)
+                want = (not cur) if req.get("toggle") else bool(req.get("on"))
+                try:
+                    backlight_set(want)
+                except Exception as e:
+                    detail = getattr(e, "stderr", "") or str(e)
+                    return self._send(
+                        f"could not switch the backlights: "
+                        f"{str(detail).strip()[:160]}".encode())
+                return self._send(
+                    f"backlights {'ON' if want else 'OFF'} "
+                    f"(GPIO{a.backlight_gpio} driven "
+                    f"{'low' if (want == (a.backlight_active == 'low')) else 'high'})"
+                    .encode())
+
             if self.path == "/specimen":
                 nb = int(self.headers.get("Content-Length", 0))
                 try:
